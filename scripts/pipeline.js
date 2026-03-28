@@ -1,0 +1,504 @@
+/**
+ * YouTube Shorts 自動生成パイプライン
+ *
+ * 使い方:
+ *   node scripts/pipeline.js          # 全ステップ実行
+ *   node scripts/pipeline.js --step=1 # ステップ単体実行
+ */
+
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { createRequire } from "module";
+
+// dotenv を動的にロード（ESM 互換）
+const require = createRequire(import.meta.url);
+try {
+  const dotenv = require("dotenv");
+  dotenv.config();
+} catch {
+  console.warn("dotenv が見つかりません。環境変数を直接設定してください。");
+}
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, "..");
+
+// ---- パス定数 ----
+const PATHS = {
+  styleGuide: path.join(ROOT, "style_guide.md"),
+  candidates: path.join(ROOT, "output", "scripts", "candidates.json"),
+  explanation: path.join(ROOT, "output", "scripts", "explanation.json"),
+  script: path.join(ROOT, "output", "scripts", "script.txt"),
+  audio: path.join(ROOT, "output", "audio", "narration.mp3"),
+  video: path.join(ROOT, "output", "videos", "final.mp4"),
+  bgm: path.join(ROOT, "output", "assets", "bgm.mp3"),
+  errorLog: path.join(ROOT, "output", "error_log.txt"),
+};
+
+// ---- ユーティリティ ----
+
+function ensureDir(filePath) {
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+function writeJson(filePath, data) {
+  ensureDir(filePath);
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
+}
+
+function readJson(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+}
+
+function writeText(filePath, text) {
+  ensureDir(filePath);
+  fs.writeFileSync(filePath, text, "utf-8");
+}
+
+function logError(stepName, error) {
+  const timestamp = new Date().toISOString();
+  const message = `[${timestamp}] [${stepName}] ${error}\n`;
+  ensureDir(PATHS.errorLog);
+  fs.appendFileSync(PATHS.errorLog, message, "utf-8");
+  console.error(message.trim());
+}
+
+/**
+ * 最大 maxRetries 回リトライしながら非同期処理を実行する。
+ * 全試行が失敗した場合は最後のエラーをスローする。
+ */
+async function withRetry(fn, maxRetries = 3, stepName = "unknown") {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      const msg = `試行 ${attempt}/${maxRetries} 失敗: ${err.message}`;
+      console.warn(`[${stepName}] ${msg}`);
+      if (attempt < maxRetries) {
+        await sleep(attempt * 1000);
+      }
+    }
+  }
+  logError(stepName, `3回リトライ後も失敗: ${lastError.message}`);
+  throw lastError;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---- Gemini API ヘルパー ----
+
+async function callGemini({ model, prompt, systemInstruction }) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY が設定されていません");
+
+  // @google/generative-ai を動的インポート
+  const { GoogleGenerativeAI } = await import("@google/generative-ai").catch(
+    () => {
+      throw new Error(
+        "@google/generative-ai パッケージが見つかりません。npm install を実行してください。"
+      );
+    }
+  );
+
+  const genAI = new GoogleGenerativeAI(apiKey);
+  const genModel = genAI.getGenerativeModel({
+    model,
+    ...(systemInstruction ? { systemInstruction } : {}),
+  });
+
+  const result = await genModel.generateContent(prompt);
+  return result.response.text();
+}
+
+// ---- ステップ実装 ----
+
+/**
+ * ステップ1: 面白い科学実験の候補を3件取得し candidates.json に保存
+ */
+async function step1_fetchCandidates() {
+  console.log("\n=== ステップ1: 実験テーマの取得 ===");
+
+  const prompt = `
+あなたはYouTube Shortsのコンテンツリサーチャーです。
+「最近バズった面白い科学実験」を3件リストアップしてください。
+
+条件:
+- 視覚的に驚ける（映像映えする）
+- 60秒以内で説明できる
+- 中学生でも理解できる
+
+出力形式（JSON のみ。コードブロック不要）:
+{
+  "candidates": [
+    {
+      "id": 1,
+      "title": "実験のタイトル（日本語）",
+      "description": "どんな実験か1〜2文で説明",
+      "keywords": ["キーワード1", "キーワード2"],
+      "buzz_reason": "なぜバズりやすいか1文で"
+    },
+    ...
+  ],
+  "retrieved_at": "ISO8601形式の日時"
+}
+`;
+
+  const rawText = await withRetry(
+    () =>
+      callGemini({
+        model: "gemini-2.0-flash-thinking-exp",
+        prompt,
+      }),
+    3,
+    "step1"
+  );
+
+  // JSON 部分だけ抽出（コードブロックで囲まれている場合を考慮）
+  const jsonText = extractJson(rawText);
+  let data;
+  try {
+    data = JSON.parse(jsonText);
+  } catch {
+    throw new Error(`Gemini の応答が JSON としてパースできません:\n${rawText}`);
+  }
+
+  if (!data.candidates || !Array.isArray(data.candidates)) {
+    throw new Error("candidates 配列が応答に含まれていません");
+  }
+
+  if (!data.retrieved_at) {
+    data.retrieved_at = new Date().toISOString();
+  }
+
+  writeJson(PATHS.candidates, data);
+  console.log(`✓ candidates.json に ${data.candidates.length} 件保存しました`);
+  data.candidates.forEach((c) => console.log(`  - ${c.title}`));
+  return data;
+}
+
+/**
+ * ステップ2: 候補から最もバズりそうな1件を選び、詳細解説を生成して explanation.json に保存
+ */
+async function step2_generateExplanation() {
+  console.log("\n=== ステップ2: 実験の深掘り解説生成 ===");
+
+  if (!fs.existsSync(PATHS.candidates)) {
+    throw new Error(
+      "candidates.json が見つかりません。先にステップ1を実行してください。"
+    );
+  }
+  const candidates = readJson(PATHS.candidates);
+
+  const prompt = `
+以下は科学実験の候補リストです。
+
+${JSON.stringify(candidates, null, 2)}
+
+この中から YouTube Shorts で最もバズりそうな実験を1件選び、
+以下の構造の JSON を出力してください（コードブロック不要）:
+
+{
+  "selected": {
+    "id": <候補のid>,
+    "title": "<タイトル>",
+    "reason_selected": "<選んだ理由（1文）>"
+  },
+  "explanation": {
+    "scientific_basis": "<科学的根拠（2〜3文）>",
+    "daily_connection": "<日常生活との繋がり（1〜2文）>",
+    "trivia": "<豆知識（1〜2文）>",
+    "common_misconception": "<よくある誤解（1〜2文）>"
+  }
+}
+`;
+
+  const rawText = await withRetry(
+    () =>
+      callGemini({
+        model: "gemini-2.5-pro-preview-03-25",
+        prompt,
+        systemInstruction:
+          "あなたは科学コンテンツの専門家です。正確で分かりやすい解説を提供してください。情報を捏造せず、不明な点は「取得失敗」と記録してください。",
+      }),
+    3,
+    "step2"
+  );
+
+  const jsonText = extractJson(rawText);
+  let data;
+  try {
+    data = JSON.parse(jsonText);
+  } catch {
+    throw new Error(`Gemini の応答が JSON としてパースできません:\n${rawText}`);
+  }
+
+  writeJson(PATHS.explanation, data);
+  console.log(`✓ explanation.json を保存しました: ${data.selected.title}`);
+  return data;
+}
+
+/**
+ * ステップ3: style_guide.md を読み込み、台本を生成して script.txt に保存
+ */
+async function step3_generateScript() {
+  console.log("\n=== ステップ3: 台本の自動生成 ===");
+
+  if (!fs.existsSync(PATHS.explanation)) {
+    throw new Error(
+      "explanation.json が見つかりません。先にステップ2を実行してください。"
+    );
+  }
+  if (!fs.existsSync(PATHS.styleGuide)) {
+    throw new Error("style_guide.md が見つかりません。");
+  }
+
+  const explanation = readJson(PATHS.explanation);
+  const styleGuide = fs.readFileSync(PATHS.styleGuide, "utf-8");
+
+  const prompt = `
+以下のスタイルガイドを**厳守**して、YouTube Shorts用の60秒台本を生成してください。
+
+=== スタイルガイド ===
+${styleGuide}
+
+=== 解説素材 ===
+${JSON.stringify(explanation, null, 2)}
+
+=== 出力形式 ===
+以下の4セクションを含む台本テキストのみ出力（JSON不要）:
+
+[フック: 0〜3秒]
+（30字以内の問いかけ or 驚き表現）
+
+[紹介: 3〜15秒]
+（実験名・概要、80字以内）
+
+[解説: 15〜50秒]
+（科学的仕組み・日常例・豆知識、200字以内）
+
+[締め: 50〜60秒]
+（日常への繋がり・知識の余韻、60字以内）
+
+スタイルガイドの禁止表現を一切使わないこと。フェニックスの口調で書くこと。
+`;
+
+  const scriptText = await withRetry(
+    () =>
+      callGemini({
+        model: "gemini-2.5-pro-preview-03-25",
+        prompt,
+        systemInstruction:
+          "あなたはフェニックスというキャラクターで台本を書くライターです。スタイルガイドを必ず守ってください。",
+      }),
+    3,
+    "step3"
+  );
+
+  writeText(PATHS.script, scriptText.trim());
+  console.log(`✓ script.txt を保存しました`);
+  console.log("--- 台本プレビュー（先頭200字） ---");
+  console.log(scriptText.slice(0, 200));
+  console.log("-----------------------------------");
+  return scriptText;
+}
+
+/**
+ * ステップ4: ElevenLabs API で音声生成し narration.mp3 に保存
+ */
+async function step4_generateAudio() {
+  console.log("\n=== ステップ4: ナレーション音声の生成 ===");
+
+  if (!fs.existsSync(PATHS.script)) {
+    throw new Error(
+      "script.txt が見つかりません。先にステップ3を実行してください。"
+    );
+  }
+
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+  const voiceId = process.env.ELEVENLABS_VOICE_ID;
+
+  if (!apiKey) throw new Error("ELEVENLABS_API_KEY が設定されていません");
+  if (!voiceId) throw new Error("ELEVENLABS_VOICE_ID が設定されていません");
+
+  const scriptText = fs.readFileSync(PATHS.script, "utf-8");
+
+  // セクションタグを除去してナレーション用テキストを作成
+  const narrationText = scriptText
+    .replace(/\[.+?\]/g, "")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
+
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
+  const body = JSON.stringify({
+    text: narrationText,
+    model_id: "eleven_multilingual_v2",
+    voice_settings: {
+      stability: 0.5,
+      similarity_boost: 0.8,
+      style: 0.4,
+      use_speaker_boost: true,
+    },
+  });
+
+  const audioBuffer = await withRetry(async () => {
+    const { default: fetch } = await import("node-fetch").catch(() => {
+      throw new Error(
+        "node-fetch パッケージが見つかりません。npm install を実行してください。"
+      );
+    });
+
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "xi-api-key": apiKey,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg",
+      },
+      body,
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`ElevenLabs API エラー ${res.status}: ${errText}`);
+    }
+
+    return Buffer.from(await res.arrayBuffer());
+  }, 3, "step4");
+
+  ensureDir(PATHS.audio);
+  fs.writeFileSync(PATHS.audio, audioBuffer);
+  const sizeMB = (audioBuffer.byteLength / 1024 / 1024).toFixed(2);
+  console.log(`✓ narration.mp3 を保存しました (${sizeMB} MB)`);
+  return PATHS.audio;
+}
+
+/**
+ * ステップ5: Remotion で動画をレンダリングし final.mp4 に保存
+ *
+ * Remotion はプロジェクトのセットアップが別途必要なため、
+ * ここでは remotion CLI を子プロセスで呼び出す。
+ * Remotion プロジェクトが未セットアップの場合はスキップして案内を表示する。
+ */
+async function step5_renderVideo() {
+  console.log("\n=== ステップ5: 動画のレンダリング ===");
+
+  // Remotion の設定ファイルが存在するか確認
+  const remotionConfig = path.join(ROOT, "remotion.config.ts");
+  const remotionConfigJs = path.join(ROOT, "remotion.config.js");
+  const hasRemotion =
+    fs.existsSync(remotionConfig) || fs.existsSync(remotionConfigJs);
+
+  if (!hasRemotion) {
+    console.warn(
+      "⚠ Remotion プロジェクトが未セットアップです。\n" +
+        "  以下の手順でセットアップしてください:\n" +
+        "  1. npm create video@latest  (別ディレクトリで)\n" +
+        "  2. 生成された remotion.config.ts と src/ をこのプロジェクトにコピー\n" +
+        "  3. src/Root.tsx で VideoComposition コンポーネントを設定\n" +
+        "  4. 再度 node scripts/pipeline.js --step=5 を実行\n\n" +
+        "  必要な仕様:\n" +
+        "  - 解像度: 1080×1920 (9:16 縦型)\n" +
+        "  - FPS: 30\n" +
+        "  - 60秒以内\n" +
+        "  - セーフゾーン: 上下15% (288px)\n" +
+        "  - 字幕: output/scripts/script.txt を参照\n" +
+        "  - 音声: output/audio/narration.mp3\n" +
+        "  - BGM: output/assets/bgm.mp3 (存在すれば使用)\n"
+    );
+    return null;
+  }
+
+  const { execSync } = await import("child_process");
+  const hasBgm = fs.existsSync(PATHS.bgm);
+
+  const props = JSON.stringify({
+    scriptPath: PATHS.script,
+    audioPath: PATHS.audio,
+    bgmPath: hasBgm ? PATHS.bgm : null,
+    safeZonePercent: 15,
+  });
+
+  ensureDir(PATHS.video);
+
+  await withRetry(
+    () => {
+      execSync(
+        `npx remotion render VideoComposition ${PATHS.video} --props='${props}'`,
+        { cwd: ROOT, stdio: "inherit" }
+      );
+    },
+    3,
+    "step5"
+  );
+
+  console.log(`✓ final.mp4 を保存しました: ${PATHS.video}`);
+  return PATHS.video;
+}
+
+// ---- JSON 抽出ヘルパー ----
+function extractJson(text) {
+  // ```json ... ``` ブロックを取り除く
+  const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (codeBlockMatch) return codeBlockMatch[1].trim();
+  // そのまま返す
+  return text.trim();
+}
+
+// ---- CLI エントリーポイント ----
+
+async function main() {
+  const args = process.argv.slice(2);
+  const stepArg = args.find((a) => a.startsWith("--step="));
+  const targetStep = stepArg ? parseInt(stepArg.split("=")[1], 10) : null;
+
+  const steps = [
+    { num: 1, fn: step1_fetchCandidates, name: "実験テーマの取得" },
+    { num: 2, fn: step2_generateExplanation, name: "深掘り解説生成" },
+    { num: 3, fn: step3_generateScript, name: "台本生成" },
+    { num: 4, fn: step4_generateAudio, name: "音声生成" },
+    { num: 5, fn: step5_renderVideo, name: "動画レンダリング" },
+  ];
+
+  // 実行するステップを絞り込む
+  const stepsToRun = targetStep
+    ? steps.filter((s) => s.num === targetStep)
+    : steps;
+
+  if (stepsToRun.length === 0) {
+    console.error(`ステップ ${targetStep} は存在しません（1〜5）`);
+    process.exit(1);
+  }
+
+  console.log("🎬 YouTube Shorts 自動生成パイプライン 開始");
+  console.log(
+    `実行ステップ: ${stepsToRun.map((s) => `${s.num}(${s.name})`).join(" → ")}\n`
+  );
+
+  for (const step of stepsToRun) {
+    try {
+      await step.fn();
+    } catch (err) {
+      console.error(`\n❌ ステップ${step.num} で致命的エラーが発生しました。`);
+      console.error(err.message);
+      logError(`step${step.num}`, err.stack || err.message);
+      console.error(
+        `エラー詳細は output/error_log.txt を確認してください。`
+      );
+      process.exit(1);
+    }
+  }
+
+  console.log("\n✅ パイプライン完了！");
+  if (!targetStep || targetStep === 5) {
+    if (fs.existsSync(PATHS.video)) {
+      console.log(`動画ファイル: ${PATHS.video}`);
+    }
+  }
+}
+
+main();

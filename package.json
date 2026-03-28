@@ -1,0 +1,23 @@
+{
+  "name": "shorts-video-pipeline",
+  "version": "1.0.0",
+  "description": "YouTube Shorts 自動生成パイプライン",
+  "main": "scripts/pipeline.js",
+  "type": "module",
+  "scripts": {
+    "start": "node scripts/pipeline.js",
+    "step1": "node scripts/pipeline.js --step=1",
+    "step2": "node scripts/pipeline.js --step=2",
+    "step3": "node scripts/pipeline.js --step=3",
+    "step4": "node scripts/pipeline.js --step=4",
+    "step5": "node scripts/pipeline.js --step=5"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
