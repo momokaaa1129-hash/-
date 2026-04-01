@@ -397,59 +397,40 @@ async function step4_generateAudio() {
     },
   });
 
-  const audioBuffer = await withRetry(() => {
-    // レスポンスステータスを確認するため、curlPost の前にヘッダーだけ取得
-    const tmpCheck = path.join(os.tmpdir(), `el_check_${Date.now()}.txt`);
+  ensureDir(PATHS.audio);
+
+  await withRetry(() => {
     const tmpBody = path.join(os.tmpdir(), `el_req_${Date.now()}.json`);
-    let buf;
     try {
       fs.writeFileSync(tmpBody, body, "utf-8");
-      // ステータスコードのみ取得
+
+      // curl 1回で直接ファイルに保存し、ステータスコードを標準出力へ
       const statusRaw = execSync(
-        `curl -sS -k -o /dev/null -w "%{http_code}" -X POST ` +
+        `curl -sS -k -X POST ` +
           `-H ${JSON.stringify(`xi-api-key: ${apiKey}`)} ` +
           `-H "Content-Type: application/json" ` +
           `-H "Accept: audio/mpeg" ` +
           `-d @${JSON.stringify(tmpBody)} ` +
+          `-o ${JSON.stringify(PATHS.audio)} ` +
+          `-w "%{http_code}" ` +
           JSON.stringify(url),
         { stdio: ["ignore", "pipe", "pipe"] }
       ).toString().trim();
 
       if (statusRaw !== "200") {
-        // エラー本文を再取得
-        const errBody = execSync(
-          `curl -sS -k -X POST ` +
-            `-H ${JSON.stringify(`xi-api-key: ${apiKey}`)} ` +
-            `-H "Content-Type: application/json" ` +
-            `-H "Accept: audio/mpeg" ` +
-            `-d @${JSON.stringify(tmpBody)} ` +
-            JSON.stringify(url),
-          { stdio: ["ignore", "pipe", "pipe"] }
-        ).toString();
+        // エラー時はレスポンス本文がファイルに入っているので読み取る
+        const errBody = fs.existsSync(PATHS.audio)
+          ? fs.readFileSync(PATHS.audio, "utf-8")
+          : "(レスポンスなし)";
+        try { fs.unlinkSync(PATHS.audio); } catch { /* ignore */ }
         throw new Error(`ElevenLabs API エラー ${statusRaw}: ${errBody}`);
       }
-
-      buf = curlPost({
-        url,
-        headers: {
-          "xi-api-key": apiKey,
-          "Content-Type": "application/json",
-          Accept: "audio/mpeg",
-        },
-        body,
-        binary: true,
-      });
     } finally {
-      for (const f of [tmpCheck, tmpBody]) {
-        try { fs.unlinkSync(f); } catch { /* ignore */ }
-      }
+      try { fs.unlinkSync(tmpBody); } catch { /* ignore */ }
     }
-    return buf;
   }, 3, "step4");
 
-  ensureDir(PATHS.audio);
-  fs.writeFileSync(PATHS.audio, audioBuffer);
-  const sizeMB = (audioBuffer.byteLength / 1024 / 1024).toFixed(2);
+  const sizeMB = (fs.statSync(PATHS.audio).size / 1024 / 1024).toFixed(2);
   console.log(`✓ narration.mp3 を保存しました (${sizeMB} MB)`);
   return PATHS.audio;
 }
