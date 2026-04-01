@@ -322,22 +322,26 @@ ${styleGuide}
 === 解説素材 ===
 ${JSON.stringify(explanation, null, 2)}
 
-=== 出力形式 ===
-以下の4セクションを含む台本テキストのみ出力（JSON不要）:
+=== 出力形式（厳守） ===
+必ず以下の形式で出力すること。セクションヘッダー行（[フック: 0〜3秒] など）は**必ず残す**こと。ヘッダーを省略しないこと。
 
 [フック: 0〜3秒]
-（30字以内の問いかけ or 驚き表現）
+ここにフックのテキスト（30字以内の問いかけ or 驚き表現）
 
 [紹介: 3〜15秒]
-（実験名・概要、80字以内）
+ここに紹介のテキスト（実験名・概要、80字以内）
 
 [解説: 15〜50秒]
-（科学的仕組み・日常例・豆知識、200字以内）
+ここに解説のテキスト（科学的仕組み・日常例・豆知識、200字以内）
 
 [締め: 50〜60秒]
-（日常への繋がり・知識の余韻、60字以内）
+ここに締めのテキスト（日常への繋がり・知識の余韻、60字以内）
 
-スタイルガイドの禁止表現を一切使わないこと。フェニックスの口調で書くこと。
+注意：
+- セクションヘッダー（[フック: 0〜3秒] 等）は必ずそのまま出力すること
+- 各セクションの（...）の説明文は出力しないこと。台本テキストのみ書くこと
+- スタイルガイドの禁止表現を一切使わないこと
+- フェニックスの口調で書くこと
 `;
 
   const scriptText = await withRetry(
@@ -437,12 +441,21 @@ async function step4_generateAudio() {
 
 /**
  * script.txt のセクションヘッダーを解析して字幕データを返す。
- * 例: "[フック: 0〜3秒]\nテキスト" → [{label:"フック", start:0, end:3, text:"テキスト"}]
+ *
+ * 対応フォーマット①（ヘッダーあり）:
+ *   [フック: 0〜3秒]
+ *   テキスト
+ *
+ * 対応フォーマット②（ヘッダーなし・Geminiがヘッダーを省略した場合）:
+ *   テキスト（段落1）
+ *
+ *   テキスト（段落2）
+ *   → 段落の順番でフック→紹介→解説→締め の固定タイミングを割り当て
  */
 function parseScriptToSubtitles(scriptText) {
-  const subtitles = [];
-  // [ラベル: 開始〜終了秒] にマッチ
-  const headerRe = /\[([^:：]+)[：:]\s*(\d+)[〜~](\d+)秒\]/g;
+  // ---- フォーマット①: タイミングヘッダーを探す ----
+  // 全角チルド(〜)・半角チルド(~)・波ダッシュ(～) をすべて許容
+  const headerRe = /\[([^:：\]]+)[：:]\s*(\d+)\s*[〜~～]\s*(\d+)秒\]/g;
   const headers = [];
   let match;
   while ((match = headerRe.exec(scriptText)) !== null) {
@@ -455,17 +468,47 @@ function parseScriptToSubtitles(scriptText) {
     });
   }
 
-  headers.forEach((h, i) => {
-    const contentStart = h.index + h.length;
-    const contentEnd =
-      i + 1 < headers.length ? headers[i + 1].index : scriptText.length;
-    const text = scriptText.slice(contentStart, contentEnd).trim();
-    if (text) {
-      subtitles.push({ label: h.label, start: h.start, end: h.end, text });
-    }
-  });
+  if (headers.length > 0) {
+    return headers
+      .map((h, i) => {
+        const contentStart = h.index + h.length;
+        const contentEnd =
+          i + 1 < headers.length ? headers[i + 1].index : scriptText.length;
+        const text = scriptText.slice(contentStart, contentEnd).trim();
+        return text ? { label: h.label, start: h.start, end: h.end, text } : null;
+      })
+      .filter(Boolean);
+  }
 
-  return subtitles;
+  // ---- フォーマット②: ヘッダーなし → 段落分割 + 固定タイミング ----
+  // Geminiがヘッダーを省略してテキストだけ出力した場合のフォールバック
+  const DEFAULT_TIMING = [
+    { label: "フック", start: 0,  end: 3  },
+    { label: "紹介",  start: 3,  end: 15 },
+    { label: "解説",  start: 15, end: 50 },
+    { label: "締め",  start: 50, end: 60 },
+  ];
+
+  const paragraphs = scriptText
+    .split(/\n{2,}/)          // 空行で段落分割
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  if (paragraphs.length === 0) return [];
+
+  // 段落数がセクション数より少ない場合は末尾のセクションに残りを結合
+  const result = DEFAULT_TIMING.map((timing, i) => {
+    if (i < paragraphs.length - 1) {
+      return { ...timing, text: paragraphs[i] };
+    }
+    if (i === DEFAULT_TIMING.length - 1) {
+      // 最後のセクション：残り段落をすべて結合
+      return { ...timing, text: paragraphs.slice(i).join("\n") };
+    }
+    return null;
+  }).filter(Boolean);
+
+  return result;
 }
 
 /**
