@@ -1,0 +1,18 @@
+{
+  "references": [
+    {
+      "url": "https://www.youtube.com/watch?v=EXAMPLE_ID_1",
+      "label": "参考動画1（テンポ・字幕スタイルが好み）",
+      "use_for": ["script_style", "video_tempo", "audio_style"]
+    }
+  ],
+  "_comment": {
+    "url": "参考にしたいYouTube動画のURL",
+    "label": "メモ用ラベル（任意）",
+    "use_for": [
+      "script_style  ... 台本のトーン・構成・テンポに反映",
+      "video_tempo   ... 動画の編集テンポ・カット割りに反映",
+      "audio_style   ... BGM・音声のスタイルに反映"
+    ]
+  }
+}
