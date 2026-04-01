@@ -8,6 +8,8 @@
 
 import fs from "fs";
 import path from "path";
+import os from "os";
+import { execSync } from "child_process";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
 
@@ -90,29 +92,85 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ---- curl ベース HTTP ヘルパー ----
+// Node.js の DNS 解決がこの環境でブロックされているため、
+// システムの curl コマンド経由でAPIリクエストを行う。
+
+/**
+ * curl を使って POST リクエストを送り、レスポンスボディを返す。
+ * @param {object} opts
+ * @param {string} opts.url
+ * @param {object} opts.headers  key-value ヘッダー
+ * @param {object|string} opts.body  JSON オブジェクトまたは文字列
+ * @param {boolean} [opts.binary]  true のとき Buffer を返す
+ * @returns {string|Buffer}
+ */
+function curlPost({ url, headers, body, binary = false }) {
+  const tmpIn = path.join(os.tmpdir(), `pipeline_req_${Date.now()}.json`);
+  const tmpOut = path.join(os.tmpdir(), `pipeline_res_${Date.now()}.bin`);
+
+  try {
+    const bodyStr = typeof body === "string" ? body : JSON.stringify(body);
+    fs.writeFileSync(tmpIn, bodyStr, "utf-8");
+
+    const headerArgs = Object.entries(headers)
+      .map(([k, v]) => `-H ${JSON.stringify(`${k}: ${v}`)}`)
+      .join(" ");
+
+    execSync(
+      `curl -sS -X POST ${headerArgs} -d @${JSON.stringify(tmpIn)} -o ${JSON.stringify(tmpOut)} ${JSON.stringify(url)}`,
+      { stdio: ["ignore", "ignore", "pipe"] }
+    );
+
+    return binary
+      ? fs.readFileSync(tmpOut)
+      : fs.readFileSync(tmpOut, "utf-8");
+  } finally {
+    for (const f of [tmpIn, tmpOut]) {
+      try { fs.unlinkSync(f); } catch { /* ignore */ }
+    }
+  }
+}
+
 // ---- Gemini API ヘルパー ----
 
-async function callGemini({ model, prompt, systemInstruction }) {
+function callGemini({ model, prompt, systemInstruction }) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY が設定されていません");
 
-  // @google/generative-ai を動的インポート
-  const { GoogleGenerativeAI } = await import("@google/generative-ai").catch(
-    () => {
-      throw new Error(
-        "@google/generative-ai パッケージが見つかりません。npm install を実行してください。"
-      );
-    }
-  );
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const genModel = genAI.getGenerativeModel({
-    model,
-    ...(systemInstruction ? { systemInstruction } : {}),
+  const contents = [{ role: "user", parts: [{ text: prompt }] }];
+  const body = {
+    contents,
+    ...(systemInstruction
+      ? { systemInstruction: { parts: [{ text: systemInstruction }] } }
+      : {}),
+    generationConfig: { responseMimeType: "text/plain" },
+  };
+
+  const raw = curlPost({
+    url,
+    headers: { "Content-Type": "application/json" },
+    body,
   });
 
-  const result = await genModel.generateContent(prompt);
-  return result.response.text();
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`Gemini API レスポンスが JSON でありません:\n${raw}`);
+  }
+
+  if (parsed.error) {
+    throw new Error(`Gemini API エラー: ${JSON.stringify(parsed.error)}`);
+  }
+
+  const text = parsed?.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) {
+    throw new Error(`Gemini API レスポンスにテキストがありません:\n${raw}`);
+  }
+  return text;
 }
 
 // ---- ステップ実装 ----
@@ -149,11 +207,7 @@ async function step1_fetchCandidates() {
 `;
 
   const rawText = await withRetry(
-    () =>
-      callGemini({
-        model: "gemini-2.0-flash-thinking-exp",
-        prompt,
-      }),
+    () => Promise.resolve(callGemini({ model: "gemini-2.0-flash-thinking-exp", prompt })),
     3,
     "step1"
   );
@@ -218,13 +272,12 @@ ${JSON.stringify(candidates, null, 2)}
 `;
 
   const rawText = await withRetry(
-    () =>
-      callGemini({
+    () => Promise.resolve(callGemini({
         model: "gemini-2.5-pro-preview-03-25",
         prompt,
         systemInstruction:
           "あなたは科学コンテンツの専門家です。正確で分かりやすい解説を提供してください。情報を捏造せず、不明な点は「取得失敗」と記録してください。",
-      }),
+      })),
     3,
     "step2"
   );
@@ -288,13 +341,12 @@ ${JSON.stringify(explanation, null, 2)}
 `;
 
   const scriptText = await withRetry(
-    () =>
-      callGemini({
+    () => Promise.resolve(callGemini({
         model: "gemini-2.5-pro-preview-03-25",
         prompt,
         systemInstruction:
           "あなたはフェニックスというキャラクターで台本を書くライターです。スタイルガイドを必ず守ってください。",
-      }),
+      })),
     3,
     "step3"
   );
@@ -345,29 +397,54 @@ async function step4_generateAudio() {
     },
   });
 
-  const audioBuffer = await withRetry(async () => {
-    const { default: fetch } = await import("node-fetch").catch(() => {
-      throw new Error(
-        "node-fetch パッケージが見つかりません。npm install を実行してください。"
-      );
-    });
+  const audioBuffer = await withRetry(() => {
+    // レスポンスステータスを確認するため、curlPost の前にヘッダーだけ取得
+    const tmpCheck = path.join(os.tmpdir(), `el_check_${Date.now()}.txt`);
+    const tmpBody = path.join(os.tmpdir(), `el_req_${Date.now()}.json`);
+    let buf;
+    try {
+      fs.writeFileSync(tmpBody, body, "utf-8");
+      // ステータスコードのみ取得
+      const statusRaw = execSync(
+        `curl -sS -o /dev/null -w "%{http_code}" -X POST ` +
+          `-H ${JSON.stringify(`xi-api-key: ${apiKey}`)} ` +
+          `-H "Content-Type: application/json" ` +
+          `-H "Accept: audio/mpeg" ` +
+          `-d @${JSON.stringify(tmpBody)} ` +
+          JSON.stringify(url),
+        { stdio: ["ignore", "pipe", "pipe"] }
+      ).toString().trim();
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "xi-api-key": apiKey,
-        "Content-Type": "application/json",
-        Accept: "audio/mpeg",
-      },
-      body,
-    });
+      if (statusRaw !== "200") {
+        // エラー本文を再取得
+        const errBody = execSync(
+          `curl -sS -X POST ` +
+            `-H ${JSON.stringify(`xi-api-key: ${apiKey}`)} ` +
+            `-H "Content-Type: application/json" ` +
+            `-H "Accept: audio/mpeg" ` +
+            `-d @${JSON.stringify(tmpBody)} ` +
+            JSON.stringify(url),
+          { stdio: ["ignore", "pipe", "pipe"] }
+        ).toString();
+        throw new Error(`ElevenLabs API エラー ${statusRaw}: ${errBody}`);
+      }
 
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(`ElevenLabs API エラー ${res.status}: ${errText}`);
+      buf = curlPost({
+        url,
+        headers: {
+          "xi-api-key": apiKey,
+          "Content-Type": "application/json",
+          Accept: "audio/mpeg",
+        },
+        body,
+        binary: true,
+      });
+    } finally {
+      for (const f of [tmpCheck, tmpBody]) {
+        try { fs.unlinkSync(f); } catch { /* ignore */ }
+      }
     }
-
-    return Buffer.from(await res.arrayBuffer());
+    return buf;
   }, 3, "step4");
 
   ensureDir(PATHS.audio);
@@ -413,7 +490,6 @@ async function step5_renderVideo() {
     return null;
   }
 
-  const { execSync } = await import("child_process");
   const hasBgm = fs.existsSync(PATHS.bgm);
 
   const props = JSON.stringify({
