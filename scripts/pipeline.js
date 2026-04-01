@@ -436,62 +436,103 @@ async function step4_generateAudio() {
 }
 
 /**
+ * script.txt のセクションヘッダーを解析して字幕データを返す。
+ * 例: "[フック: 0〜3秒]\nテキスト" → [{label:"フック", start:0, end:3, text:"テキスト"}]
+ */
+function parseScriptToSubtitles(scriptText) {
+  const subtitles = [];
+  // [ラベル: 開始〜終了秒] にマッチ
+  const headerRe = /\[([^:：]+)[：:]\s*(\d+)[〜~](\d+)秒\]/g;
+  const headers = [];
+  let match;
+  while ((match = headerRe.exec(scriptText)) !== null) {
+    headers.push({
+      label: match[1].trim(),
+      start: parseInt(match[2], 10),
+      end: parseInt(match[3], 10),
+      index: match.index,
+      length: match[0].length,
+    });
+  }
+
+  headers.forEach((h, i) => {
+    const contentStart = h.index + h.length;
+    const contentEnd =
+      i + 1 < headers.length ? headers[i + 1].index : scriptText.length;
+    const text = scriptText.slice(contentStart, contentEnd).trim();
+    if (text) {
+      subtitles.push({ label: h.label, start: h.start, end: h.end, text });
+    }
+  });
+
+  return subtitles;
+}
+
+/**
  * ステップ5: Remotion で動画をレンダリングし final.mp4 に保存
- *
- * Remotion はプロジェクトのセットアップが別途必要なため、
- * ここでは remotion CLI を子プロセスで呼び出す。
- * Remotion プロジェクトが未セットアップの場合はスキップして案内を表示する。
  */
 async function step5_renderVideo() {
   console.log("\n=== ステップ5: 動画のレンダリング ===");
 
-  // Remotion の設定ファイルが存在するか確認
-  const remotionConfig = path.join(ROOT, "remotion.config.ts");
-  const remotionConfigJs = path.join(ROOT, "remotion.config.js");
-  const hasRemotion =
-    fs.existsSync(remotionConfig) || fs.existsSync(remotionConfigJs);
-
-  if (!hasRemotion) {
-    console.warn(
-      "⚠ Remotion プロジェクトが未セットアップです。\n" +
-        "  以下の手順でセットアップしてください:\n" +
-        "  1. npm create video@latest  (別ディレクトリで)\n" +
-        "  2. 生成された remotion.config.ts と src/ をこのプロジェクトにコピー\n" +
-        "  3. src/Root.tsx で VideoComposition コンポーネントを設定\n" +
-        "  4. 再度 node scripts/pipeline.js --step=5 を実行\n\n" +
-        "  必要な仕様:\n" +
-        "  - 解像度: 1080×1920 (9:16 縦型)\n" +
-        "  - FPS: 30\n" +
-        "  - 60秒以内\n" +
-        "  - セーフゾーン: 上下15% (288px)\n" +
-        "  - 字幕: output/scripts/script.txt を参照\n" +
-        "  - 音声: output/audio/narration.mp3\n" +
-        "  - BGM: output/assets/bgm.mp3 (存在すれば使用)\n"
+  // 前提ファイルの確認
+  if (!fs.existsSync(PATHS.script)) {
+    throw new Error(
+      "script.txt が見つかりません。先にステップ3を実行してください。"
     );
-    return null;
+  }
+  if (!fs.existsSync(PATHS.audio)) {
+    throw new Error(
+      "narration.mp3 が見つかりません。先にステップ4を実行してください。"
+    );
   }
 
-  const hasBgm = fs.existsSync(PATHS.bgm);
+  // ---- 字幕データを script.txt から生成 ----
+  const scriptText = fs.readFileSync(PATHS.script, "utf-8");
+  const subtitles = parseScriptToSubtitles(scriptText);
+  if (subtitles.length === 0) {
+    throw new Error(
+      "script.txt からタイミング情報を読み取れませんでした。\n" +
+        "フォーマット例: [フック: 0〜3秒]"
+    );
+  }
+  console.log(`  字幕セクション: ${subtitles.map((s) => s.label).join(" → ")}`);
 
-  const props = JSON.stringify({
-    scriptPath: PATHS.script,
-    audioPath: PATHS.audio,
-    bgmPath: hasBgm ? PATHS.bgm : null,
-    safeZonePercent: 15,
-  });
+  // ---- 音声ファイルを public/ にコピー（Remotionが参照できる場所） ----
+  const publicDir = path.join(ROOT, "public");
+  fs.mkdirSync(publicDir, { recursive: true });
+  fs.copyFileSync(PATHS.audio, path.join(publicDir, "narration.mp3"));
+  console.log("  ✓ narration.mp3 → public/");
+
+  const hasBgm = fs.existsSync(PATHS.bgm);
+  if (hasBgm) {
+    fs.copyFileSync(PATHS.bgm, path.join(publicDir, "bgm.mp3"));
+    console.log("  ✓ bgm.mp3 → public/");
+  }
+
+  // ---- 動画の長さ = 字幕の最終終了時刻 ----
+  const durationInSeconds = Math.max(...subtitles.map((s) => s.end));
+
+  // ---- props をファイルに書き出す（Windowsでの引数エスケープ問題を回避） ----
+  const props = { subtitles, hasBgm, durationInSeconds };
+  const propsFile = path.join(os.tmpdir(), `remotion_props_${Date.now()}.json`);
+  fs.writeFileSync(propsFile, JSON.stringify(props), "utf-8");
 
   ensureDir(PATHS.video);
 
   await withRetry(
     () => {
       execSync(
-        `npx remotion render VideoComposition ${PATHS.video} --props='${props}'`,
+        `npx remotion render src/index.jsx VideoComposition` +
+          ` ${JSON.stringify(PATHS.video)}` +
+          ` --props=${JSON.stringify(propsFile)}`,
         { cwd: ROOT, stdio: "inherit" }
       );
     },
     3,
     "step5"
   );
+
+  try { fs.unlinkSync(propsFile); } catch { /* ignore */ }
 
   console.log(`✓ final.mp4 を保存しました: ${PATHS.video}`);
   return PATHS.video;
