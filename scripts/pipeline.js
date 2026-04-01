@@ -118,7 +118,7 @@ function curlPost({ url, headers, body, binary = false }) {
       .join(" ");
 
     execSync(
-      `curl -sS -X POST ${headerArgs} -d @${JSON.stringify(tmpIn)} -o ${JSON.stringify(tmpOut)} ${JSON.stringify(url)}`,
+      `curl -sS -k -X POST ${headerArgs} -d @${JSON.stringify(tmpIn)} -o ${JSON.stringify(tmpOut)} ${JSON.stringify(url)}`,
       { stdio: ["ignore", "ignore", "pipe"] }
     );
 
@@ -406,7 +406,7 @@ async function step4_generateAudio() {
       fs.writeFileSync(tmpBody, body, "utf-8");
       // ステータスコードのみ取得
       const statusRaw = execSync(
-        `curl -sS -o /dev/null -w "%{http_code}" -X POST ` +
+        `curl -sS -k -o /dev/null -w "%{http_code}" -X POST ` +
           `-H ${JSON.stringify(`xi-api-key: ${apiKey}`)} ` +
           `-H "Content-Type: application/json" ` +
           `-H "Accept: audio/mpeg" ` +
@@ -418,7 +418,7 @@ async function step4_generateAudio() {
       if (statusRaw !== "200") {
         // エラー本文を再取得
         const errBody = execSync(
-          `curl -sS -X POST ` +
+          `curl -sS -k -X POST ` +
             `-H ${JSON.stringify(`xi-api-key: ${apiKey}`)} ` +
             `-H "Content-Type: application/json" ` +
             `-H "Accept: audio/mpeg" ` +
