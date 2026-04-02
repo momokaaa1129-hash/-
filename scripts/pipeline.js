@@ -31,11 +31,13 @@ const PATHS = {
   candidates:  path.join(ROOT, "output", "scripts", "candidates.json"),
   explanation: path.join(ROOT, "output", "scripts", "explanation.json"),
   script:      path.join(ROOT, "output", "scripts", "script.txt"),
+  timing:      path.join(ROOT, "output", "scripts", "timing.json"),
   audio:       path.join(ROOT, "output", "audio", "narration.mp3"),
   video:       path.join(ROOT, "output", "videos", "final.mp4"),
   bgm:         path.join(ROOT, "output", "assets", "bgm.mp3"),
   background:  path.join(ROOT, "output", "assets", "background.mp4"),
   clips:       path.join(ROOT, "output", "assets", "clips"),
+  sfxDir:      path.join(ROOT, "output", "assets", "sfx"),
   errorLog:    path.join(ROOT, "output", "error_log.txt"),
 };
 
@@ -132,6 +134,70 @@ function curlPost({ url, headers, body, binary = false }) {
       try { fs.unlinkSync(f); } catch { /* ignore */ }
     }
   }
+}
+
+/**
+ * curl を使って GET リクエストを送る。
+ */
+function curlGet({ url, headers = {} }) {
+  const headerArgs = Object.entries(headers)
+    .map(([k, v]) => `-H ${JSON.stringify(`${k}: ${v}`)}`)
+    .join(" ");
+  return execSync(
+    `curl -sS -k ${headerArgs} ${JSON.stringify(url)}`,
+    { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }
+  );
+}
+
+// ---- ElevenLabs 誤読対策：読み仮名変換テーブル ----
+// ElevenLabsが誤読しやすい漢字をひらがなに置換する
+const KANJI_TTS_MAP = [
+  // 長いものを先に並べて部分一致の誤置換を防ぐ
+  ["過酸化水素", "かさんかすいそ"],
+  ["電気分解",   "でんきぶんかい"],
+  ["原子核",     "げんしかく"],
+  ["中性子",     "ちゅうせいし"],
+  ["酸化",       "さんか"],
+  ["還元",       "かんげん"],
+  ["触媒",       "しょくばい"],
+  ["分解",       "ぶんかい"],
+  ["反応",       "はんのう"],
+  ["気体",       "きたい"],
+  ["液体",       "えきたい"],
+  ["固体",       "こたい"],
+  ["水素",       "すいそ"],
+  ["酸素",       "さんそ"],
+  ["燃焼",       "ねんしょう"],
+  ["密度",       "みつど"],
+  ["濃度",       "のうど"],
+  ["溶液",       "ようえき"],
+  ["溶解",       "ようかい"],
+  ["結晶",       "けっしょう"],
+  ["中和",       "ちゅうわ"],
+  ["電流",       "でんりゅう"],
+  ["電圧",       "でんあつ"],
+  ["磁力",       "じりょく"],
+  ["重力",       "じゅうりょく"],
+  ["慣性",       "かんせい"],
+  ["圧力",       "あつりょく"],
+  ["温度",       "おんど"],
+  ["速度",       "そくど"],
+  ["分子",       "ぶんし"],
+  ["原子",       "げんし"],
+  ["電子",       "でんし"],
+  ["陽子",       "ようし"],
+  ["炎",         "ほのお"],
+  ["泡",         "あわ"],
+  ["熱",         "ねつ"],
+  ["光",         "ひかり"],
+];
+
+function convertKanjiForTTS(text) {
+  let result = text;
+  for (const [kanji, reading] of KANJI_TTS_MAP) {
+    result = result.replaceAll(kanji, reading);
+  }
+  return result;
 }
 
 // ---- Gemini API ヘルパー ----
@@ -344,6 +410,9 @@ ${JSON.stringify(explanation, null, 2)}
 - 各セクションの（...）の説明文は出力しないこと。台本テキストのみ書くこと
 - スタイルガイドの禁止表現を一切使わないこと
 - フェニックスの口調で書くこと
+- 読みが複数ある漢字や専門用語は、テキスト音声合成（TTS）での誤読を防ぐため
+  直接ひらがなで書くこと
+  例：酸素 → さんそ、触媒 → しょくばい、泡 → あわ、炎 → ほのお
 `;
 
   const scriptText = await withRetry(
@@ -386,10 +455,13 @@ async function step4_generateAudio() {
   const scriptText = fs.readFileSync(PATHS.script, "utf-8");
 
   // セクションタグを除去してナレーション用テキストを作成
-  const narrationText = scriptText
-    .replace(/\[.+?\]/g, "")
-    .replace(/\n{2,}/g, "\n")
-    .trim();
+  // さらに漢字→読み仮名変換でElevenLabsの誤読を防ぐ
+  const narrationText = convertKanjiForTTS(
+    scriptText
+      .replace(/\[.+?\]/g, "")
+      .replace(/\n{2,}/g, "\n")
+      .trim()
+  );
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
   const body = JSON.stringify({
@@ -442,6 +514,47 @@ async function step4_generateAudio() {
 }
 
 /**
+ * ステップWhisper: faster-whisper で narration.mp3 を解析し
+ * フレーズ単位のタイムスタンプを output/scripts/timing.json に保存する。
+ *
+ * 前提: pip install faster-whisper
+ */
+async function stepWhisper_alignAudio() {
+  console.log("\n=== ステップWhisper: 音声タイミング解析 ===");
+
+  if (!fs.existsSync(PATHS.audio)) {
+    throw new Error(
+      "narration.mp3 が見つかりません。先にステップ4を実行してください。"
+    );
+  }
+
+  const whisperScript = path.join(ROOT, "scripts", "whisper_align.py");
+
+  // Python コマンド（Windows: py / mac+linux: python3 を優先）
+  const pythonCmd = process.platform === "win32" ? "py" : "python3";
+
+  await withRetry(
+    () => {
+      execSync(`${pythonCmd} "${whisperScript}"`, {
+        cwd: ROOT,
+        stdio: "inherit",
+        timeout: 300000, // 最大5分
+      });
+    },
+    3,
+    "stepWhisper"
+  );
+
+  if (!fs.existsSync(PATHS.timing)) {
+    throw new Error("timing.json の生成に失敗しました。");
+  }
+
+  const timing = readJson(PATHS.timing);
+  console.log(`✓ タイミング解析完了 (${timing.phrase_count} フレーズ)`);
+  return PATHS.timing;
+}
+
+/**
  * ステップBG: YouTube動画から背景クリップを生成し background.mp4 に保存する。
  *
  * 前提ツール（要インストール）:
@@ -459,80 +572,144 @@ async function stepBg_fetchBackgroundVideo() {
     try {
       execSync(cmd, { stdio: "pipe" });
     } catch {
-      throw new Error(
-        `${cmd.split(" ")[0]} が見つかりません。\n  インストール: ${hint}`
-      );
+      throw new Error(`${cmd.split(" ")[0]} が見つかりません。\n  インストール: ${hint}`);
     }
   }
 
   // explanation.json からキーワード取得
   if (!fs.existsSync(PATHS.explanation)) {
-    throw new Error(
-      "explanation.json が見つかりません。先にステップ2を実行してください。"
-    );
+    throw new Error("explanation.json が見つかりません。先にステップ2を実行してください。");
   }
   const explanation = readJson(PATHS.explanation);
-  const searchQuery = explanation.selected.title
+  const jpQuery = explanation.selected.title
     .replace(/["""''「」【】（）()]/g, "")
     .trim();
-  console.log(`  検索クエリ: "${searchQuery}"`);
 
-  // ---- yt-dlp で動画IDを検索 ----
-  let videoIds;
-  await withRetry(() => {
-    const raw = execSync(
-      `yt-dlp "ytsearch8:${searchQuery} experiment" --flat-playlist --print id --no-warnings`,
-      { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }
-    );
-    videoIds = raw.trim().split(/\r?\n/).filter(Boolean).slice(0, 8);
-    if (videoIds.length === 0) throw new Error("検索結果が0件でした");
-  }, 3, "stepBg-search");
-  console.log(`  ${videoIds.length} 件の動画IDを取得`);
+  // Gemini で英語キーワードを生成（失敗しても日本語だけで続行）
+  let enQuery = "";
+  try {
+    enQuery = callGemini({
+      model: "gemini-2.0-flash",
+      prompt: `次の日本語の科学実験名をYouTube検索用の英語キーワードに訳してください（2〜4単語のみ出力）: "${jpQuery}"`,
+    }).trim().replace(/["""]/g, "").slice(0, 60);
+    console.log(`  日本語: "${jpQuery}"  英語: "${enQuery}"`);
+  } catch {
+    console.warn("  ⚠ 英語キーワードの生成をスキップ（日本語のみで検索）");
+  }
 
-  // ---- 各動画から5秒クリップをダウンロード＋縦型変換 ----
+  // ---- yt-dlp で動画IDを収集（日本語 + 英語、重複排除） ----
+  const seenIds = new Set();
+  const allVideoIds = [];
+
+  const queries = [
+    `${jpQuery} 実験`,
+    ...(enQuery ? [`${enQuery} experiment`] : []),
+  ];
+
+  for (const q of queries) {
+    try {
+      const raw = execSync(
+        `yt-dlp "ytsearch8:${q}" --flat-playlist --print id --no-warnings`,
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }
+      );
+      for (const id of raw.trim().split(/\r?\n/).filter(Boolean)) {
+        if (!seenIds.has(id)) {
+          seenIds.add(id);
+          allVideoIds.push(id);
+        }
+      }
+    } catch (err) {
+      console.warn(`  ⚠ "${q}" の検索をスキップ: ${err.message.slice(0, 60)}`);
+    }
+  }
+
+  // Pexels 動画を追加（APIキーが設定されている場合のみ）
+  const pexelsKey = process.env.PEXELS_API_KEY;
+  const pexelsClipUrls = [];
+  if (pexelsKey) {
+    const pexelsQuery = enQuery || jpQuery;
+    try {
+      const raw = curlGet({
+        url: `https://api.pexels.com/videos/search?query=${encodeURIComponent(pexelsQuery)}&per_page=5&orientation=portrait`,
+        headers: { "Authorization": pexelsKey },
+      });
+      const data = JSON.parse(raw);
+      for (const v of (data.videos || [])) {
+        // 縦型優先・最大720p
+        const file =
+          v.video_files.find((f) => f.width <= 1080 && f.height >= 720 && f.height <= 1920) ||
+          v.video_files[0];
+        if (file?.link) pexelsClipUrls.push({ id: `pexels_${v.id}`, url: file.link });
+      }
+      console.log(`  Pexels: ${pexelsClipUrls.length} 件`);
+    } catch (err) {
+      console.warn(`  ⚠ Pexels をスキップ: ${err.message.slice(0, 60)}`);
+    }
+  }
+
+  if (allVideoIds.length === 0 && pexelsClipUrls.length === 0) {
+    throw new Error("動画の検索結果が0件でした。ネットワーク接続を確認してください。");
+  }
+  console.log(`  合計 ${allVideoIds.length} 件のYouTube ID（重複排除済み）`);
+
+  // ---- クリップ変換ヘルパー ----
   fs.mkdirSync(PATHS.clips, { recursive: true });
   const processedClips = [];
+  let clipIndex = 0;
 
-  for (let i = 0; i < videoIds.length && processedClips.length < 6; i++) {
-    const vid = videoIds[i];
-    // 出力先（拡張子は yt-dlp が決める）
-    const rawPattern = path.join(PATHS.clips, `raw_${i}.%(ext)s`).replace(/\\/g, "/");
-    const processedClip = path.join(PATHS.clips, `clip_${i}.mp4`);
-
+  /** rawファイルをffmpegで縦型1080x1920・5秒に変換してprocessedClipsに追加 */
+  function processRawClip(rawPath, label) {
+    const processed = path.join(PATHS.clips, `clip_${clipIndex}.mp4`);
     try {
-      // yt-dlp: 最初の5秒だけダウンロード（ffmpegが必要）
-      execSync(
-        `yt-dlp -f "best[height<=720]" --download-sections "*0-5" ` +
-          `--no-part --no-continue --no-warnings ` +
-          `-o "${rawPattern}" ` +
-          `"https://www.youtube.com/watch?v=${vid}"`,
-        { stdio: "pipe", timeout: 60000 }
-      );
-
-      // ダウンロードされた実ファイルを探す
-      const rawFile = fs
-        .readdirSync(PATHS.clips)
-        .find((f) => f.startsWith(`raw_${i}.`));
-      if (!rawFile) continue;
-      const rawPath = path.join(PATHS.clips, rawFile);
-
-      // ffmpeg: 縦型1080x1920に変換・5秒・音声除去
       execSync(
         `ffmpeg -y -i "${rawPath}" -t 5 ` +
           `-vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30" ` +
-          `-c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -an ` +
-          `"${processedClip}"`,
+          `-c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -an "${processed}"`,
         { stdio: "pipe", timeout: 90000 }
       );
-
-      if (fs.existsSync(processedClip) && fs.statSync(processedClip).size > 1000) {
-        processedClips.push(processedClip);
-        console.log(`  ✓ クリップ${processedClips.length} (${vid})`);
+      if (fs.existsSync(processed) && fs.statSync(processed).size > 5000) {
+        processedClips.push(processed);
+        console.log(`  ✓ クリップ${processedClips.length} [${label}]`);
+        clipIndex++;
+        return true;
       }
-      // rawファイルを削除
-      try { fs.unlinkSync(rawPath); } catch { /* ignore */ }
     } catch (err) {
-      console.warn(`  ⚠ ${vid} をスキップ: ${err.message.slice(0, 80)}`);
+      console.warn(`  ⚠ 変換失敗 [${label}]: ${err.message.slice(0, 60)}`);
+    }
+    try { fs.unlinkSync(rawPath); } catch { /* ignore */ }
+    return false;
+  }
+
+  // ---- YouTube クリップ ----
+  for (const vid of allVideoIds) {
+    if (processedClips.length >= 6) break;
+    const rawPattern = path.join(PATHS.clips, `raw_yt_${clipIndex}.%(ext)s`).replace(/\\/g, "/");
+    try {
+      execSync(
+        `yt-dlp -f "best[height<=720]" --download-sections "*0-5" ` +
+          `--no-part --no-continue --no-warnings -o "${rawPattern}" ` +
+          `"https://www.youtube.com/watch?v=${vid}"`,
+        { stdio: "pipe", timeout: 60000 }
+      );
+      const rawFile = fs.readdirSync(PATHS.clips).find((f) => f.startsWith(`raw_yt_${clipIndex}.`));
+      if (rawFile) processRawClip(path.join(PATHS.clips, rawFile), vid);
+    } catch (err) {
+      console.warn(`  ⚠ YouTube ${vid} をスキップ: ${err.message.slice(0, 60)}`);
+    }
+  }
+
+  // ---- Pexels クリップ ----
+  for (const { id, url } of pexelsClipUrls) {
+    if (processedClips.length >= 8) break;
+    const rawPath = path.join(PATHS.clips, `raw_px_${clipIndex}.mp4`);
+    try {
+      execSync(
+        `curl -sS -k -L -o "${rawPath}" "${url}"`,
+        { stdio: "pipe", timeout: 60000 }
+      );
+      if (fs.existsSync(rawPath)) processRawClip(rawPath, id);
+    } catch (err) {
+      console.warn(`  ⚠ Pexels ${id} をスキップ: ${err.message.slice(0, 60)}`);
     }
   }
 
@@ -551,18 +728,92 @@ async function stepBg_fetchBackgroundVideo() {
     processedClips.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"),
     "utf-8"
   );
-
   ensureDir(PATHS.background);
   execSync(
     `ffmpeg -y -f concat -safe 0 -i "${concatList}" -c copy "${PATHS.background}"`,
     { stdio: "pipe" }
   );
 
-  const totalSec = processedClips.length * 5;
-  console.log(
-    `✓ background.mp4 を保存しました（${processedClips.length}クリップ・約${totalSec}秒）`
-  );
+  console.log(`✓ background.mp4 を保存しました（${processedClips.length}クリップ）`);
   return PATHS.background;
+}
+
+/**
+ * ステップSFX: Freesound API から効果音を取得し output/assets/sfx/ に保存する。
+ *
+ * 必要な設定: .env に FREESOUND_API_KEY を追加
+ * 取得方法: https://freesound.org/apiv2/apply/
+ *
+ * 取得する効果音:
+ *   whoosh.mp3  … フック開始時（インパクト音）
+ *   chime.mp3   … 締め開始時（余韻チャイム）
+ */
+async function stepSfx_fetchSoundEffects() {
+  console.log("\n=== ステップSFX: 効果音の取得 ===");
+
+  const apiKey = process.env.FREESOUND_API_KEY;
+  if (!apiKey) {
+    console.warn(
+      "  ⚠ FREESOUND_API_KEY が未設定です。.env に追加してください。\n" +
+        "    取得: https://freesound.org/apiv2/apply/\n" +
+        "  効果音なしで続行します。"
+    );
+    return null;
+  }
+
+  fs.mkdirSync(PATHS.sfxDir, { recursive: true });
+
+  const SFX_TARGETS = [
+    { name: "whoosh", query: "whoosh swipe fast",    outFile: "whoosh.mp3" },
+    { name: "chime",  query: "soft chime bell calm", outFile: "chime.mp3"  },
+  ];
+
+  for (const target of SFX_TARGETS) {
+    const outPath = path.join(PATHS.sfxDir, target.outFile);
+    if (fs.existsSync(outPath)) {
+      console.log(`  ✓ ${target.outFile} はキャッシュ済み`);
+      continue;
+    }
+
+    try {
+      // Freesound でテキスト検索
+      const searchUrl =
+        `https://freesound.org/apiv2/search/text/?query=${encodeURIComponent(target.query)}` +
+        `&token=${apiKey}&fields=id,name,previews&page_size=5&format=json`;
+      const raw = curlGet({ url: searchUrl });
+      const data = JSON.parse(raw);
+      const results = data.results ?? [];
+
+      if (results.length === 0) {
+        console.warn(`  ⚠ "${target.query}" の検索結果が0件`);
+        continue;
+      }
+
+      // 最初のヒットのプレビューURLをダウンロード
+      const previewUrl = results[0]?.previews?.["preview-hq-mp3"] ??
+                         results[0]?.previews?.["preview-lq-mp3"];
+      if (!previewUrl) {
+        console.warn(`  ⚠ ${target.name}: プレビューURLが見つかりません`);
+        continue;
+      }
+
+      execSync(
+        `curl -sS -k -L -o "${outPath}" "${previewUrl}"`,
+        { stdio: "pipe", timeout: 30000 }
+      );
+
+      if (fs.existsSync(outPath) && fs.statSync(outPath).size > 1000) {
+        console.log(`  ✓ ${target.outFile} を保存しました`);
+      } else {
+        console.warn(`  ⚠ ${target.outFile} のダウンロードに失敗しました`);
+        try { fs.unlinkSync(outPath); } catch { /* ignore */ }
+      }
+    } catch (err) {
+      console.warn(`  ⚠ ${target.name} をスキップ: ${err.message.slice(0, 80)}`);
+    }
+  }
+
+  return PATHS.sfxDir;
 }
 
 /**
@@ -685,17 +936,49 @@ async function step5_renderVideo() {
     console.log("  ✓ background.mp4 → public/");
   }
 
+  // ---- 効果音ファイルを public/sfx/ にコピー ----
+  const sfxFiles = {};
+  if (fs.existsSync(PATHS.sfxDir)) {
+    const sfxPublic = path.join(publicDir, "sfx");
+    fs.mkdirSync(sfxPublic, { recursive: true });
+    for (const fname of ["whoosh.mp3", "chime.mp3"]) {
+      const src = path.join(PATHS.sfxDir, fname);
+      if (fs.existsSync(src)) {
+        fs.copyFileSync(src, path.join(sfxPublic, fname));
+        sfxFiles[fname.replace(".mp3", "")] = true;
+        console.log(`  ✓ sfx/${fname} → public/sfx/`);
+      }
+    }
+  }
+
   // ---- 音声の実長を取得してフレーズタイムラインを構築 ----
   const audioDuration = getAudioDuration(PATHS.audio);
   const durationInSeconds = Math.min(
     audioDuration,
     Math.max(...subtitles.map((s) => s.end))
   );
-  const phrases = buildPhraseTimeline(subtitles, durationInSeconds);
+
+  // timing.json があればWhisperの精密タイミングを優先する
+  let phrases;
+  if (fs.existsSync(PATHS.timing)) {
+    console.log("  Whisperタイミングを使用します (timing.json)");
+    const timingData = readJson(PATHS.timing);
+    const hookEnd = subtitles.find((s) => s.label === "フック")?.end ?? 3;
+    phrases = timingData.phrases.map((p) => ({
+      ...p,
+      isHook: p.end <= hookEnd,
+    }));
+  } else {
+    console.log("  推定タイミングを使用します（精度向上には --step=whisper を実行）");
+    phrases = buildPhraseTimeline(subtitles, durationInSeconds);
+  }
   console.log(`  フレーズ総数: ${phrases.length}`);
 
+  // ---- 締めセクションの開始フレームを計算（効果音用） ----
+  const endingSec = subtitles.find((s) => s.label === "締め")?.start ?? 50;
+
   // ---- props をファイルに書き出す（Windowsでの引数エスケープ問題を回避） ----
-  const props = { phrases, hasBackground, hasBgm, durationInSeconds };
+  const props = { phrases, hasBackground, hasBgm, durationInSeconds, sfxFiles, endingSec };
   const propsFile = path.join(os.tmpdir(), `remotion_props_${Date.now()}.json`);
   fs.writeFileSync(propsFile, JSON.stringify(props), "utf-8");
 
@@ -817,18 +1100,20 @@ async function main() {
   const args = process.argv.slice(2);
   const stepArg = args.find((a) => a.startsWith("--step="));
   const stepStr = stepArg ? stepArg.split("=")[1] : null;
-  // "bg" は文字列のまま、数字は整数に変換
+  // "bg" / "whisper" / "sfx" は文字列のまま、数字は整数に変換
   const targetStep = stepStr
-    ? stepStr === "bg" ? "bg" : parseInt(stepStr, 10)
+    ? /^\d+$/.test(stepStr) ? parseInt(stepStr, 10) : stepStr
     : null;
 
   const steps = [
-    { num: 1,    fn: step1_fetchCandidates,       name: "実験テーマの取得" },
-    { num: 2,    fn: step2_generateExplanation,   name: "深掘り解説生成" },
-    { num: 3,    fn: step3_generateScript,         name: "台本生成" },
-    { num: 4,    fn: step4_generateAudio,          name: "音声生成" },
-    { num: "bg", fn: stepBg_fetchBackgroundVideo, name: "背景動画生成" },
-    { num: 5,    fn: step5_renderVideo,            name: "動画レンダリング" },
+    { num: 1,         fn: step1_fetchCandidates,       name: "実験テーマの取得" },
+    { num: 2,         fn: step2_generateExplanation,   name: "深掘り解説生成" },
+    { num: 3,         fn: step3_generateScript,        name: "台本生成" },
+    { num: 4,         fn: step4_generateAudio,         name: "音声生成" },
+    { num: "whisper", fn: stepWhisper_alignAudio,      name: "音声タイミング解析" },
+    { num: "bg",      fn: stepBg_fetchBackgroundVideo, name: "背景動画生成" },
+    { num: "sfx",     fn: stepSfx_fetchSoundEffects,   name: "効果音取得" },
+    { num: 5,         fn: step5_renderVideo,           name: "動画レンダリング" },
   ];
 
   const stepsToRun = targetStep !== null
@@ -838,7 +1123,7 @@ async function main() {
   if (stepsToRun.length === 0) {
     console.error(
       `ステップ "${targetStep}" は存在しません。\n` +
-      `有効な値: 1, 2, 3, 4, bg, 5`
+      `有効な値: 1, 2, 3, 4, whisper, bg, sfx, 5`
     );
     process.exit(1);
   }

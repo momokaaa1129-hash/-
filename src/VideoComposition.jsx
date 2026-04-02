@@ -2,6 +2,7 @@ import {
   AbsoluteFill,
   Audio,
   Video,
+  Sequence,
   staticFile,
   useCurrentFrame,
   useVideoConfig,
@@ -9,30 +10,34 @@ import {
 } from "remotion";
 
 // ---- 定数 ----
-const SAFE_ZONE_RATIO = 0.15; // 上下15%のセーフゾーン
+const SAFE_ZONE_RATIO = 0.15; // 上下15% = 288px
 const FONT_FAMILY =
   '"Hiragino Sans", "Yu Gothic UI", "Meiryo", "Noto Sans JP", sans-serif';
 
 // ---- メインコンポーネント ----
-// props（pipeline.js の step5 から渡される）:
-//   phrases         ... [{text, start, end, isHook}]
-//   hasBackground   ... background.mp4 があれば true
-//   hasBgm          ... bgm.mp3 があれば true
-//   durationInSeconds ... 動画の秒数
+// props（pipeline.js step5 から渡される）:
+//   phrases         [{text, start, end, isHook}]
+//   hasBackground   background.mp4 があれば true
+//   hasBgm          bgm.mp3 があれば true
+//   durationInSeconds
+//   sfxFiles        {whoosh: bool, chime: bool}
+//   endingSec       締めセクション開始秒
 
 export const VideoComposition = ({
   phrases,
   hasBackground,
   hasBgm,
   durationInSeconds,
+  sfxFiles = {},
+  endingSec = 50,
 }) => {
   const frame = useCurrentFrame();
   const { fps, height } = useVideoConfig();
 
   const currentTime = frame / fps;
-  const safeY = height * SAFE_ZONE_RATIO; // = 288px
+  const safeY = height * SAFE_ZONE_RATIO; // 288px
 
-  // 現在表示するフレーズを探す
+  // 現在のフレーズを探す
   const allPhrases = phrases ?? [];
   const currentIdx = allPhrases.findIndex(
     (p) => currentTime >= p.start && currentTime < p.end
@@ -40,7 +45,7 @@ export const VideoComposition = ({
   const currentPhrase = currentIdx >= 0 ? allPhrases[currentIdx] : null;
   const isHook = currentPhrase?.isHook ?? false;
 
-  // フレーズの先頭フレームからのローカルフレーム数（アニメーション計算用）
+  // フレーズ内のローカルフレーム（アニメーション用）
   const phraseStartFrame = currentPhrase
     ? Math.round(currentPhrase.start * fps)
     : 0;
@@ -50,10 +55,10 @@ export const VideoComposition = ({
   const localFrame = frame - phraseStartFrame;
 
   // ---- フェードイン・アウト ----
-  const FADE = 4; // フェードのフレーム数
+  const FADE = 4;
+  const canFade  = phraseDurFrames > FADE * 2;
+  const canScale = phraseDurFrames > FADE;
 
-  // フレーズが短すぎてFADE*2を下回る場合はフェードをスキップ（opacity固定1）
-  const canFade = phraseDurFrames > FADE * 2;
   const opacity = currentPhrase
     ? canFade
       ? interpolate(
@@ -65,21 +70,20 @@ export const VideoComposition = ({
       : 1
     : 0;
 
-  // ---- スケールアニメーション（フレーズ切り替わり時に少し拡大→通常サイズ） ----
-  // フレーズがFADE以上ある場合のみ適用
-  const canScale = phraseDurFrames > FADE;
-  const scale = currentPhrase
-    ? canScale
-      ? interpolate(localFrame, [0, FADE], [isHook ? 1.12 : 0.90, 1.0], {
-          extrapolateLeft: "clamp",
-          extrapolateRight: "clamp",
-        })
-      : 1
+  // ---- スケールアニメーション ----
+  const scale = currentPhrase && canScale
+    ? interpolate(localFrame, [0, FADE], [isHook ? 1.1 : 0.88, 1.0], {
+        extrapolateLeft: "clamp",
+        extrapolateRight: "clamp",
+      })
     : 1;
 
-  // フック: 大きなフォント・画面中央  /  それ以外: やや小さめ・中央より下
-  const fontSize = isHook ? 92 : 56;
-  const overlayAlpha = isHook ? 0.72 : 0.45;
+  // ---- フォントサイズ・オーバーレイ ----
+  const fontSize    = isHook ? 120 : 90;   // 改善2: 拡大
+  const overlayAlpha = isHook ? 0.70 : 0.42;
+
+  // 締めセクション開始フレーム（効果音用）
+  const endingFrame = Math.round(endingSec * fps);
 
   return (
     <AbsoluteFill>
@@ -94,7 +98,6 @@ export const VideoComposition = ({
           />
         </AbsoluteFill>
       ) : (
-        /* 背景動画がない場合のフォールバックグラデーション */
         <AbsoluteFill
           style={{
             background:
@@ -103,27 +106,40 @@ export const VideoComposition = ({
         />
       )}
 
-      {/* ── 暗いオーバーレイ（背景動画の上に乗せて文字を読みやすくする） ── */}
+      {/* ── 暗いオーバーレイ ── */}
       <AbsoluteFill
         style={{ backgroundColor: `rgba(0,0,0,${overlayAlpha})` }}
       />
 
-      {/* ── ナレーション音声 ── */}
+      {/* ── ナレーション ── */}
       <Audio src={staticFile("narration.mp3")} />
 
-      {/* ── BGM（音量18%） ── */}
+      {/* ── BGM ── */}
       {hasBgm && <Audio src={staticFile("bgm.mp3")} volume={0.18} />}
 
-      {/* ── フレーズ字幕 ── */}
+      {/* ── 効果音: フック開始時 whoosh ── */}
+      {sfxFiles.whoosh && (
+        <Sequence from={0} durationInFrames={fps * 2}>
+          <Audio src={staticFile("sfx/whoosh.mp3")} volume={0.45} />
+        </Sequence>
+      )}
+
+      {/* ── 効果音: 締め開始時 chime ── */}
+      {sfxFiles.chime && endingFrame > 0 && (
+        <Sequence from={endingFrame} durationInFrames={fps * 4}>
+          <Audio src={staticFile("sfx/chime.mp3")} volume={0.35} />
+        </Sequence>
+      )}
+
+      {/* ── 字幕エリア ── */}
       {currentPhrase && (
         <AbsoluteFill
           style={{
-            // フック = 画面中央、それ以外 = 下寄り（セーフゾーン内）
             justifyContent: isHook ? "center" : "flex-end",
             alignItems: "center",
-            paddingBottom: isHook ? 0 : safeY + 40,
-            paddingLeft: 40,
-            paddingRight: 40,
+            paddingBottom: isHook ? 0 : safeY + 30,
+            paddingLeft: 36,
+            paddingRight: 36,
           }}
         >
           <div
@@ -131,14 +147,16 @@ export const VideoComposition = ({
               transform: `scale(${scale})`,
               opacity,
               textAlign: "center",
-              // フックのみ半透明背景で囲む
-              ...(isHook
-                ? {
-                    background: "rgba(0,0,0,0.3)",
-                    borderRadius: 24,
-                    padding: "24px 48px",
-                  }
-                : {}),
+              // 改善2: 半透明の黒帯（視認性向上）
+              backgroundColor: isHook
+                ? "rgba(0,0,0,0.35)"
+                : "rgba(0,0,0,0.55)",
+              borderRadius: isHook ? 20 : 14,
+              paddingTop:    isHook ? 28 : 18,
+              paddingBottom: isHook ? 28 : 18,
+              paddingLeft:   isHook ? 52 : 36,
+              paddingRight:  isHook ? 52 : 36,
+              maxWidth: "100%",
             }}
           >
             <span
@@ -148,15 +166,19 @@ export const VideoComposition = ({
                 fontSize,
                 fontWeight: 900,
                 fontFamily: FONT_FAMILY,
-                lineHeight: 1.45,
-                letterSpacing: "0.04em",
-                // 黒い縁取り（4方向のtextShadow）
+                lineHeight: 1.4,
+                letterSpacing: "0.05em",
+                // 改善2: 太い黒縁取り（4方向 + ぼかし）
                 textShadow: [
-                  "-3px -3px 0 #000",
-                  " 3px -3px 0 #000",
-                  "-3px  3px 0 #000",
-                  " 3px  3px 0 #000",
-                  "0 0 24px rgba(0,0,0,0.9)",
+                  "-4px -4px 0 #000",
+                  " 4px -4px 0 #000",
+                  "-4px  4px 0 #000",
+                  " 4px  4px 0 #000",
+                  "-2px  0   0 #000",
+                  " 2px  0   0 #000",
+                  " 0   -2px 0 #000",
+                  " 0    2px 0 #000",
+                  "0 0 20px rgba(0,0,0,0.95)",
                 ].join(", "),
               }}
             >

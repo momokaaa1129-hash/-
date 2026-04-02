@@ -22,6 +22,8 @@ const RemotionRoot = () => {
         hasBackground: false, // background.mp4 があれば true
         hasBgm: false,        // bgm.mp3 があれば true
         durationInSeconds: 60,
+        sfxFiles: {},         // {whoosh: bool, chime: bool}
+        endingSec: 50,        // 締めセクション開始秒
       }}
     />
   );
