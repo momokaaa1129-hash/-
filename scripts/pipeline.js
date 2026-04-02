@@ -275,7 +275,7 @@ async function step1_fetchCandidates() {
 `;
 
   const rawText = await withRetry(
-    () => Promise.resolve(callGemini({ model: "gemini-2.0-flash-thinking-exp", prompt })),
+    () => Promise.resolve(callGemini({ model: "gemini-2.5-flash", prompt })),
     3,
     "step1"
   );
@@ -341,7 +341,7 @@ ${JSON.stringify(candidates, null, 2)}
 
   const rawText = await withRetry(
     () => Promise.resolve(callGemini({
-        model: "gemini-2.5-pro-preview-03-25",
+        model: "gemini-2.5-flash",
         prompt,
         systemInstruction:
           "あなたは科学コンテンツの専門家です。正確で分かりやすい解説を提供してください。情報を捏造せず、不明な点は「取得失敗」と記録してください。",
@@ -417,7 +417,7 @@ ${JSON.stringify(explanation, null, 2)}
 
   const scriptText = await withRetry(
     () => Promise.resolve(callGemini({
-        model: "gemini-2.5-pro-preview-03-25",
+        model: "gemini-2.5-flash",
         prompt,
         systemInstruction:
           "あなたはフェニックスというキャラクターで台本を書くライターです。スタイルガイドを必ず守ってください。",
@@ -589,7 +589,7 @@ async function stepBg_fetchBackgroundVideo() {
   let enQuery = "";
   try {
     enQuery = callGemini({
-      model: "gemini-2.0-flash",
+      model: "gemini-2.5-flash",
       prompt: `次の日本語の科学実験名をYouTube検索用の英語キーワードに訳してください（2〜4単語のみ出力）: "${jpQuery}"`,
     }).trim().replace(/["""]/g, "").slice(0, 60);
     console.log(`  日本語: "${jpQuery}"  英語: "${enQuery}"`);
