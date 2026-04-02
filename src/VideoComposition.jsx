@@ -14,6 +14,138 @@ const SAFE_ZONE_RATIO = 0.15; // 上下15% = 288px
 const FONT_FAMILY =
   '"Hiragino Sans", "Yu Gothic UI", "Meiryo", "Noto Sans JP", sans-serif';
 
+// ---- 図説オーバーレイ ----
+// diagram: { timing, duration, type, steps: [{text, arrow?}] }
+// 背景を暗くし、3ステップが左からフェードインで順番に登場する。
+const DiagramOverlay = ({ diagram, fps, frame }) => {
+  const startFrame  = Math.round(diagram.timing * fps);
+  const totalFrames = Math.max(2, Math.round(diagram.duration * fps));
+  const localFrame  = frame - startFrame;
+
+  if (localFrame < 0 || localFrame >= totalFrames) return null;
+
+  const steps = diagram.steps ?? [];
+
+  // オーバーレイ全体のフェードイン・アウト
+  const FADE = 8;
+  const canFade = totalFrames > FADE * 2;
+  const overlayOpacity = canFade
+    ? interpolate(
+        localFrame,
+        [0, FADE, totalFrames - FADE, totalFrames],
+        [0, 1, 1, 0],
+        { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
+      )
+    : 1;
+
+  // ステップは全体の前半 60% で順番に表示
+  const revealWindow = totalFrames * 0.6;
+  const framesPerStep = steps.length > 1 ? revealWindow / steps.length : revealWindow;
+
+  return (
+    <AbsoluteFill
+      style={{
+        backgroundColor: "rgba(0,0,0,0.88)",
+        opacity: overlayOpacity,
+        justifyContent: "center",
+        alignItems: "center",
+        paddingLeft: 56,
+        paddingRight: 56,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          width: "100%",
+          gap: 0,
+        }}
+      >
+        {steps.map((step, i) => {
+          const stepStart = Math.round(framesPerStep * i);
+          const STEP_FADE = Math.min(10, Math.max(2, Math.round(framesPerStep * 0.5)));
+          const stepOpacity = interpolate(
+            localFrame,
+            [stepStart, Math.min(stepStart + STEP_FADE, totalFrames - 1)],
+            [0, 1],
+            { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
+          );
+          const stepX = interpolate(
+            localFrame,
+            [stepStart, Math.min(stepStart + STEP_FADE, totalFrames - 1)],
+            [-50, 0],
+            { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
+          );
+
+          return (
+            <div
+              key={i}
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                width: "100%",
+              }}
+            >
+              {/* ステップボックス */}
+              <div
+                style={{
+                  opacity: stepOpacity,
+                  transform: `translateX(${stepX}px)`,
+                  backgroundColor: "rgba(79,195,247,0.15)",
+                  border: "3px solid rgba(79,195,247,0.7)",
+                  borderLeft: "8px solid #4fc3f7",
+                  borderRadius: 16,
+                  paddingTop: 22,
+                  paddingBottom: 22,
+                  paddingLeft: 36,
+                  paddingRight: 36,
+                  width: "100%",
+                  textAlign: "center",
+                }}
+              >
+                <span
+                  style={{
+                    display: "block",
+                    color: "#ffffff",
+                    fontSize: 72,
+                    fontWeight: 900,
+                    fontFamily: FONT_FAMILY,
+                    lineHeight: 1.3,
+                    letterSpacing: "0.04em",
+                    textShadow: "0 2px 16px rgba(0,0,0,0.9)",
+                  }}
+                >
+                  {step.text}
+                </span>
+              </div>
+
+              {/* 矢印（次のステップへ） */}
+              {step.arrow && i < steps.length - 1 && (
+                <div
+                  style={{
+                    opacity: stepOpacity,
+                    color: "#4fc3f7",
+                    fontSize: 64,
+                    fontWeight: 900,
+                    lineHeight: 1,
+                    marginTop: 6,
+                    marginBottom: 6,
+                    textShadow: "0 0 20px rgba(79,195,247,0.6)",
+                  }}
+                >
+                  ↓
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </AbsoluteFill>
+  );
+};
+
 // ---- メインコンポーネント ----
 // props（pipeline.js step5 から渡される）:
 //   phrases         [{text, start, end, isHook}]
@@ -22,6 +154,7 @@ const FONT_FAMILY =
 //   durationInSeconds
 //   sfxFiles        {whoosh: bool, chime: bool}
 //   endingSec       締めセクション開始秒
+//   diagrams        [{timing, duration, type, steps}]
 
 export const VideoComposition = ({
   phrases,
@@ -30,6 +163,7 @@ export const VideoComposition = ({
   durationInSeconds,
   sfxFiles = {},
   endingSec = 50,
+  diagrams = [],
 }) => {
   const frame = useCurrentFrame();
   const { fps, height } = useVideoConfig();
@@ -44,6 +178,12 @@ export const VideoComposition = ({
   );
   const currentPhrase = currentIdx >= 0 ? allPhrases[currentIdx] : null;
   const isHook = currentPhrase?.isHook ?? false;
+
+  // 現在表示すべき図説を探す
+  const allDiagrams = diagrams ?? [];
+  const currentDiagram = allDiagrams.find(
+    (d) => currentTime >= d.timing && currentTime < d.timing + d.duration
+  ) ?? null;
 
   // フレーズ内のローカルフレーム（アニメーション用）
   const phraseStartFrame = currentPhrase
@@ -79,7 +219,7 @@ export const VideoComposition = ({
     : 1;
 
   // ---- フォントサイズ・オーバーレイ ----
-  const fontSize    = isHook ? 120 : 90;   // 改善2: 拡大
+  const fontSize     = isHook ? 120 : 90;
   const overlayAlpha = isHook ? 0.70 : 0.42;
 
   // 締めセクション開始フレーム（効果音用）
@@ -106,10 +246,12 @@ export const VideoComposition = ({
         />
       )}
 
-      {/* ── 暗いオーバーレイ ── */}
-      <AbsoluteFill
-        style={{ backgroundColor: `rgba(0,0,0,${overlayAlpha})` }}
-      />
+      {/* ── 通常オーバーレイ（図説中は DiagramOverlay が上書き） ── */}
+      {!currentDiagram && (
+        <AbsoluteFill
+          style={{ backgroundColor: `rgba(0,0,0,${overlayAlpha})` }}
+        />
+      )}
 
       {/* ── ナレーション ── */}
       <Audio src={staticFile("narration.mp3")} />
@@ -131,8 +273,13 @@ export const VideoComposition = ({
         </Sequence>
       )}
 
-      {/* ── 字幕エリア ── */}
-      {currentPhrase && (
+      {/* ── 図説オーバーレイ（解説パート途中に挿入） ── */}
+      {allDiagrams.map((diagram, i) => (
+        <DiagramOverlay key={i} diagram={diagram} fps={fps} frame={frame} />
+      ))}
+
+      {/* ── 字幕エリア（図説表示中は非表示） ── */}
+      {currentPhrase && !currentDiagram && (
         <AbsoluteFill
           style={{
             justifyContent: isHook ? "center" : "flex-end",
@@ -147,7 +294,6 @@ export const VideoComposition = ({
               transform: `scale(${scale})`,
               opacity,
               textAlign: "center",
-              // 改善2: 半透明の黒帯（視認性向上）
               backgroundColor: isHook
                 ? "rgba(0,0,0,0.35)"
                 : "rgba(0,0,0,0.55)",
@@ -168,7 +314,6 @@ export const VideoComposition = ({
                 fontFamily: FONT_FAMILY,
                 lineHeight: 1.4,
                 letterSpacing: "0.05em",
-                // 改善2: 太い黒縁取り（4方向 + ぼかし）
                 textShadow: [
                   "-4px -4px 0 #000",
                   " 4px -4px 0 #000",

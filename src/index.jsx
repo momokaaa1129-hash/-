@@ -24,6 +24,7 @@ const RemotionRoot = () => {
         durationInSeconds: 60,
         sfxFiles: {},         // {whoosh: bool, chime: bool}
         endingSec: 50,        // 締めセクション開始秒
+        diagrams: [],         // [{timing, duration, type, steps}] 図説アニメ
       }}
     />
   );

@@ -396,8 +396,26 @@ ${JSON.stringify(candidates, null, 2)}
     "daily_connection": "<日常生活との繋がり（1〜2文）>",
     "trivia": "<豆知識（1〜2文）>",
     "common_misconception": "<よくある誤解（1〜2文）>"
-  }
+  },
+  "diagrams": [
+    {
+      "timing": <解説パート(15〜50秒)の中で図説を表示する秒数。例: 25>,
+      "duration": <表示秒数。5〜8秒を推奨>,
+      "type": "flow",
+      "steps": [
+        {"text": "<ステップ1のテキスト（10字以内）>", "arrow": "→"},
+        {"text": "<ステップ2のテキスト（10字以内）>", "arrow": "→"},
+        {"text": "<ステップ3のテキスト（10字以内）>"}
+      ]
+    }
+  ]
 }
+
+diagrams の注意点:
+- この実験の「仕組み」を3ステップの因果関係で説明すること
+- steps は必ず3つ。最後のステップに arrow は不要
+- timing は必ず 18〜44 の範囲にすること（解説パート内）
+- テキストは短く・インパクトある表現にすること
 `;
 
   const rawText = await withRetry(
@@ -1125,8 +1143,20 @@ async function step5_renderVideo() {
   // ---- 締めセクションの開始フレームを計算（効果音用） ----
   const endingSec = subtitles.find((s) => s.label === "締め")?.start ?? 50;
 
+  // ---- explanation.json から図説データを取得 ----
+  let diagrams = [];
+  if (fs.existsSync(PATHS.explanation)) {
+    try {
+      const exp = readJson(PATHS.explanation);
+      diagrams = exp.diagrams ?? [];
+      if (diagrams.length > 0) {
+        console.log(`  図説: ${diagrams.length} 件 (${diagrams.map((d) => `${d.timing}秒`).join(", ")})`);
+      }
+    } catch { /* explanation.json が壊れていても続行 */ }
+  }
+
   // ---- props をファイルに書き出す（Windowsでの引数エスケープ問題を回避） ----
-  const props = { phrases, hasBackground, hasBgm, durationInSeconds, sfxFiles, endingSec };
+  const props = { phrases, hasBackground, hasBgm, durationInSeconds, sfxFiles, endingSec, diagrams };
   const propsFile = path.join(os.tmpdir(), `remotion_props_${Date.now()}.json`);
   fs.writeFileSync(propsFile, JSON.stringify(props), "utf-8");
 
