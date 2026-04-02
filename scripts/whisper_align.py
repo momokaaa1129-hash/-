@@ -15,9 +15,10 @@ import sys
 from pathlib import Path
 
 # ---- 設定 ----
-MODEL_SIZE = "small"   # "tiny" / "small" / "medium" / "large-v3"
-MAX_CHARS  = 10        # 1フレーズの最大文字数
-SPLIT_CHARS = set("。、！？…\n")  # フレーズ区切り文字
+MODEL_SIZE     = "small"                        # "tiny" / "small" / "medium" / "large-v3"
+MAX_CHARS      = 15                             # 1フレーズの最大文字数
+SPLIT_CHARS    = set("。、！？…\n")             # 句読点（ここで必ず区切る）
+PARTICLE_CHARS = set("はがをにでともの")         # 助詞（バッファ4字以上なら区切る）
 
 
 def load_model():
@@ -74,10 +75,11 @@ def group_into_phrases(segments_gen):
         buf_text += w["word"]
         buf_end   = w["end"]
 
-        # 区切り文字が含まれるか、最大文字数に達したら分割
+        # 句読点 / 助詞の後 / 最大文字数 のいずれかで分割
         should_split = (
             len(buf_text) >= MAX_CHARS
             or any(c in buf_text for c in SPLIT_CHARS)
+            or (len(buf_text) >= 4 and buf_text[-1] in PARTICLE_CHARS)
         )
         if should_split:
             phrases.append({

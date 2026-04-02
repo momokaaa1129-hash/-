@@ -244,31 +244,90 @@ function callGemini({ model, prompt, systemInstruction }) {
 // ---- ステップ実装 ----
 
 /**
- * ステップ1: 面白い科学実験の候補を3件取得し candidates.json に保存
+ * ステップ1: 英語キーワードで海外実験動画を5件収集し、
+ * Gemini にタイトルを分析させて candidates.json に保存する。
+ *
+ * ワークフロー: 動画先行 → 台本生成
+ *   動画のタイトル・IDを素材にして解説を生成することで
+ *   背景動画と台本の内容が一致する。
  */
 async function step1_fetchCandidates() {
-  console.log("\n=== ステップ1: 実験テーマの取得 ===");
+  console.log("\n=== ステップ1: 海外実験動画の収集 ===");
+
+  // yt-dlp の存在確認
+  try {
+    execSync("yt-dlp --version", { stdio: "pipe" });
+  } catch {
+    throw new Error("yt-dlp が見つかりません。\n  インストール: pip install yt-dlp");
+  }
+
+  const SEARCH_QUERIES = [
+    "science experiment amazing reaction",
+    "cool chemistry experiment kids",
+    "physics experiment viral reaction",
+  ];
+
+  const seenIds = new Set();
+  const videoItems = [];
+
+  for (const q of SEARCH_QUERIES) {
+    if (videoItems.length >= 5) break;
+    try {
+      const raw = execSync(
+        `yt-dlp "ytsearch5:${q}" --flat-playlist --print "%(id)s\t%(title)s" --no-warnings`,
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }
+      );
+      for (const line of raw.trim().split(/\r?\n/).filter(Boolean)) {
+        if (videoItems.length >= 5) break;
+        const tabIdx = line.indexOf("\t");
+        const id    = tabIdx >= 0 ? line.slice(0, tabIdx).trim() : line.trim();
+        const title = tabIdx >= 0 ? line.slice(tabIdx + 1).trim() : "";
+        if (id && !seenIds.has(id)) {
+          seenIds.add(id);
+          videoItems.push({ id, title: title || id });
+        }
+      }
+    } catch (err) {
+      console.warn(`  ⚠ "${q}" の検索をスキップ: ${err.message.slice(0, 60)}`);
+    }
+  }
+
+  if (videoItems.length === 0) {
+    throw new Error("動画の検索結果が0件でした。ネットワーク接続を確認してください。");
+  }
+
+  console.log(`  ${videoItems.length} 件の動画を取得しました`);
+  videoItems.forEach((v) => console.log(`    - [${v.id}] ${v.title}`));
+
+  // Gemini がタイトルを分析し「何の実験か」を把握、最もバズりそうな1件を選ぶ
+  const videoList = videoItems
+    .map((v, i) => `${i + 1}. [VideoID: ${v.id}] ${v.title}`)
+    .join("\n");
 
   const prompt = `
-あなたはYouTube Shortsのコンテンツリサーチャーです。
-「最近バズった面白い科学実験」を3件リストアップしてください。
+以下は海外の科学実験動画のリスト（YouTubeのID + タイトル）です。
+
+${videoList}
+
+これらの各動画を「タイトルから推測して、この動画で何が起きているか」を把握し、
+YouTube Shortsで最もバズりそうな実験を1件選んでください。
 
 条件:
 - 視覚的に驚ける（映像映えする）
 - 60秒以内で説明できる
 - 中学生でも理解できる
 
-出力形式（JSON のみ。コードブロック不要）:
+出力形式（JSONのみ。コードブロック不要）:
 {
   "candidates": [
     {
       "id": 1,
-      "title": "実験のタイトル（日本語）",
-      "description": "どんな実験か1〜2文で説明",
+      "video_id": "<選んだ動画のYouTube ID>",
+      "title": "実験名（日本語）",
+      "description": "この動画で何が起きているか（1〜2文、日本語）",
       "keywords": ["キーワード1", "キーワード2"],
-      "buzz_reason": "なぜバズりやすいか1文で"
-    },
-    ...
+      "buzz_reason": "なぜバズりやすいか（1文）"
+    }
   ],
   "retrieved_at": "ISO8601形式の日時"
 }
@@ -280,7 +339,6 @@ async function step1_fetchCandidates() {
     "step1"
   );
 
-  // JSON 部分だけ抽出（コードブロックで囲まれている場合を考慮）
   const jsonText = extractJson(rawText);
   let data;
   try {
@@ -293,13 +351,13 @@ async function step1_fetchCandidates() {
     throw new Error("candidates 配列が応答に含まれていません");
   }
 
-  if (!data.retrieved_at) {
-    data.retrieved_at = new Date().toISOString();
-  }
+  // 収集した全動画IDを保存（stepBg が再利用できるよう）
+  data.source_video_ids = videoItems.map((v) => v.id);
+  data.retrieved_at = data.retrieved_at || new Date().toISOString();
 
   writeJson(PATHS.candidates, data);
-  console.log(`✓ candidates.json に ${data.candidates.length} 件保存しました`);
-  data.candidates.forEach((c) => console.log(`  - ${c.title}`));
+  console.log(`✓ candidates.json を保存しました`);
+  data.candidates.forEach((c) => console.log(`  - ${c.title} [${c.video_id}]`));
   return data;
 }
 
@@ -317,20 +375,23 @@ async function step2_generateExplanation() {
   const candidates = readJson(PATHS.candidates);
 
   const prompt = `
-以下は科学実験の候補リストです。
+以下は海外の科学実験動画をもとに収集した候補リストです。
+各候補の "description" フィールドには「この動画で何が起きているか」が書かれています。
 
 ${JSON.stringify(candidates, null, 2)}
 
 この中から YouTube Shorts で最もバズりそうな実験を1件選び、
-以下の構造の JSON を出力してください（コードブロック不要）:
+日本語視聴者向けの詳しい解説を以下の JSON 形式で出力してください（コードブロック不要）:
 
 {
   "selected": {
     "id": <候補のid>,
-    "title": "<タイトル>",
+    "video_id": "<選んだ候補の video_id>",
+    "title": "<実験タイトル（日本語）>",
     "reason_selected": "<選んだ理由（1文）>"
   },
   "explanation": {
+    "what_happens": "<この実験・動画で何が起きているか（1〜2文）>",
     "scientific_basis": "<科学的根拠（2〜3文）>",
     "daily_connection": "<日常生活との繋がり（1〜2文）>",
     "trivia": "<豆知識（1〜2文）>",
@@ -387,8 +448,15 @@ async function step3_generateScript() {
 === スタイルガイド ===
 ${styleGuide}
 
-=== 解説素材 ===
+=== 解説素材（海外実験動画をもとに生成） ===
 ${JSON.stringify(explanation, null, 2)}
+
+=== 台本の流れ（厳守） ===
+この動画で「何が起きているか」を視聴者が理解できるよう、以下の流れで構成すること:
+  フック    → 「なぜこうなるの？」という疑問・驚きで視聴者を掴む
+  紹介      → 「実はこういう現象なんだ」と現象を紹介
+  解説      → 「仕組みはこうだよ」と科学的に説明
+  締め      → 「日常でも〇〇に使われてる」と身近な例で締める
 
 === 出力形式（厳守） ===
 必ず以下の形式で出力すること。セクションヘッダー行（[フック: 0〜3秒] など）は**必ず残す**こと。ヘッダーを省略しないこと。
@@ -576,50 +644,53 @@ async function stepBg_fetchBackgroundVideo() {
     }
   }
 
-  // explanation.json からキーワード取得
-  if (!fs.existsSync(PATHS.explanation)) {
-    throw new Error("explanation.json が見つかりません。先にステップ2を実行してください。");
-  }
-  const explanation = readJson(PATHS.explanation);
-  const jpQuery = explanation.selected.title
-    .replace(/["""''「」【】（）()]/g, "")
-    .trim();
-
-  // Gemini で英語キーワードを生成（失敗しても日本語だけで続行）
-  let enQuery = "";
-  try {
-    enQuery = callGemini({
-      model: "gemini-2.5-flash",
-      prompt: `次の日本語の科学実験名をYouTube検索用の英語キーワードに訳してください（2〜4単語のみ出力）: "${jpQuery}"`,
-    }).trim().replace(/["""]/g, "").slice(0, 60);
-    console.log(`  日本語: "${jpQuery}"  英語: "${enQuery}"`);
-  } catch {
-    console.warn("  ⚠ 英語キーワードの生成をスキップ（日本語のみで検索）");
-  }
-
-  // ---- yt-dlp で動画IDを収集（日本語 + 英語、重複排除） ----
+  // candidates.json の source_video_ids を優先して再利用（step1 で収集済み）
+  // なければ explanation.json のキーワードから英語で検索
   const seenIds = new Set();
   const allVideoIds = [];
 
-  const queries = [
-    `${jpQuery} 実験`,
-    ...(enQuery ? [`${enQuery} experiment`] : []),
-  ];
+  if (fs.existsSync(PATHS.candidates)) {
+    const candidates = readJson(PATHS.candidates);
+    const srcIds = candidates.source_video_ids ?? [];
+    if (srcIds.length > 0) {
+      console.log(`  step1 で収集した動画IDを再利用 (${srcIds.length} 件)`);
+      for (const id of srcIds) {
+        if (!seenIds.has(id)) { seenIds.add(id); allVideoIds.push(id); }
+      }
+    }
+  }
 
-  for (const q of queries) {
+  // IDが足りない場合は英語キーワードで追加検索
+  if (allVideoIds.length < 4) {
+    if (!fs.existsSync(PATHS.explanation)) {
+      throw new Error("explanation.json が見つかりません。先にステップ2を実行してください。");
+    }
+    const explanation = readJson(PATHS.explanation);
+    const jpTitle = explanation.selected.title.replace(/["""''「」【】（）()]/g, "").trim();
+
+    let enQuery = "";
+    try {
+      enQuery = callGemini({
+        model: "gemini-2.5-flash",
+        prompt: `次の日本語の科学実験名をYouTube検索用の英語キーワードに訳してください（2〜4単語のみ出力）: "${jpTitle}"`,
+      }).trim().replace(/["""]/g, "").slice(0, 60);
+      console.log(`  英語キーワード: "${enQuery}"`);
+    } catch {
+      console.warn("  ⚠ 英語キーワードの生成をスキップ");
+    }
+
+    // 英語キーワードのみで検索（海外動画を優先）
+    const searchQ = enQuery ? `${enQuery} experiment` : "science experiment amazing";
     try {
       const raw = execSync(
-        `yt-dlp "ytsearch8:${q}" --flat-playlist --print id --no-warnings`,
+        `yt-dlp "ytsearch8:${searchQ}" --flat-playlist --print id --no-warnings`,
         { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }
       );
       for (const id of raw.trim().split(/\r?\n/).filter(Boolean)) {
-        if (!seenIds.has(id)) {
-          seenIds.add(id);
-          allVideoIds.push(id);
-        }
+        if (!seenIds.has(id)) { seenIds.add(id); allVideoIds.push(id); }
       }
     } catch (err) {
-      console.warn(`  ⚠ "${q}" の検索をスキップ: ${err.message.slice(0, 60)}`);
+      console.warn(`  ⚠ "${searchQ}" の検索をスキップ: ${err.message.slice(0, 60)}`);
     }
   }
 
@@ -627,7 +698,15 @@ async function stepBg_fetchBackgroundVideo() {
   const pexelsKey = process.env.PEXELS_API_KEY;
   const pexelsClipUrls = [];
   if (pexelsKey) {
-    const pexelsQuery = enQuery || jpQuery;
+    // candidates.json の実験タイトルを英語キーワードとして使用
+    let pexelsQuery = "science experiment";
+    if (fs.existsSync(PATHS.candidates)) {
+      try {
+        const cands = readJson(PATHS.candidates);
+        const title = cands.candidates?.[0]?.title ?? "";
+        if (title) pexelsQuery = title.replace(/["""''「」【】（）()]/g, "").trim();
+      } catch { /* ignore */ }
+    }
     try {
       const raw = curlGet({
         url: `https://api.pexels.com/videos/search?query=${encodeURIComponent(pexelsQuery)}&per_page=5&orientation=portrait`,
@@ -683,10 +762,15 @@ async function stepBg_fetchBackgroundVideo() {
   // ---- YouTube クリップ ----
   for (const vid of allVideoIds) {
     if (processedClips.length >= 6) break;
+    // オープニングをスキップするため開始位置を 30〜60 秒後にランダム設定
+    const startSec = Math.floor(Math.random() * 31) + 30;
+    const endSec   = startSec + 5;
     const rawPattern = path.join(PATHS.clips, `raw_yt_${clipIndex}.%(ext)s`).replace(/\\/g, "/");
     try {
       execSync(
-        `yt-dlp -f "best[height<=720]" --download-sections "*0-5" ` +
+        `yt-dlp -f "best[height<=720]" ` +
+          `--download-sections "*${startSec}-${endSec}" ` +
+          `--match-filter "!subtitles" ` +
           `--no-part --no-continue --no-warnings -o "${rawPattern}" ` +
           `"https://www.youtube.com/watch?v=${vid}"`,
         { stdio: "pipe", timeout: 60000 }
@@ -814,6 +898,70 @@ async function stepSfx_fetchSoundEffects() {
   }
 
   return PATHS.sfxDir;
+}
+
+/**
+ * ステップBGM: archive.org から著作権フリー音楽を取得し bgm.mp3 に保存する。
+ * APIキー不要。すでに bgm.mp3 があればスキップ。
+ */
+async function stepBgm_fetchBGM() {
+  console.log("\n=== ステップBGM: BGM取得 ===");
+
+  if (fs.existsSync(PATHS.bgm)) {
+    console.log("  ✓ bgm.mp3 はキャッシュ済み");
+    return PATHS.bgm;
+  }
+
+  ensureDir(PATHS.bgm);
+
+  // archive.org の著作権フリー楽曲を検索（APIキー不要）
+  const searchUrl =
+    "https://archive.org/advancedsearch.php?" +
+    "q=subject%3A%22royalty+free%22+subject%3A%22instrumental%22+mediatype%3Aaudio" +
+    "&fl[]=identifier,title&sort[]=downloads+desc&rows=10&page=1&output=json";
+
+  try {
+    const raw = curlGet({ url: searchUrl });
+    const data = JSON.parse(raw);
+    const items = data?.response?.docs ?? [];
+
+    if (items.length === 0) {
+      console.warn("  ⚠ archive.org 検索結果が0件でした");
+      return null;
+    }
+
+    for (const item of items.slice(0, 5)) {
+      const id = item.identifier;
+      try {
+        const filesRaw = curlGet({ url: `https://archive.org/metadata/${id}/files` });
+        const filesData = JSON.parse(filesRaw);
+        const mp3 = (filesData?.result ?? []).find(
+          (f) => f.name?.endsWith(".mp3") && f.source === "original"
+        );
+        if (!mp3) continue;
+
+        const mp3Url =
+          `https://archive.org/download/${encodeURIComponent(id)}/${encodeURIComponent(mp3.name)}`;
+        execSync(
+          `curl -sS -k -L -o "${PATHS.bgm}" "${mp3Url}"`,
+          { stdio: "pipe", timeout: 90000 }
+        );
+
+        if (fs.existsSync(PATHS.bgm) && fs.statSync(PATHS.bgm).size > 10000) {
+          console.log(`  ✓ BGMを保存しました: ${mp3.name} (archive.org/${id})`);
+          return PATHS.bgm;
+        }
+      } catch { /* 次の候補を試す */ }
+    }
+  } catch (err) {
+    console.warn(`  ⚠ archive.org BGM取得をスキップ: ${err.message.slice(0, 60)}`);
+  }
+
+  console.warn(
+    "  ⚠ BGMの自動取得に失敗しました。\n" +
+    "    output/assets/bgm.mp3 に著作権フリーの音楽ファイルを手動で配置してください。"
+  );
+  return null;
 }
 
 /**
@@ -1026,33 +1174,32 @@ function getAudioDuration(audioPath) {
 }
 
 /**
- * 日本語テキストを句読点・最大文字数で短いフレーズに分割する。
- * maxChars: 1フレーズの最大文字数（デフォルト10）
+ * 日本語テキストを文節単位で短いフレーズに分割する。
+ * 分割条件（優先順）:
+ *   1. 句読点（。、！？…\n）→ 必ず区切る
+ *   2. 助詞（は が を に で と も の）の直後 かつ バッファ4字以上
+ *   3. maxChars に達した場合
  */
-function splitIntoPhrases(text, maxChars = 10) {
+function splitIntoPhrases(text, maxChars = 15) {
   if (!text) return [];
-  // 句点・読点・感嘆符・疑問符・改行の後ろで分割（区切り文字は前のフレーズに含める）
-  const parts = text.split(/(?<=[。、！？…\n])/);
+  const PUNCT    = new Set([..."。、！？…\n"]);
+  const PARTICLES = new Set([..."はがをにでともの"]);
   const result = [];
   let buf = "";
 
-  for (const part of parts) {
-    const p = part.trim();
-    if (!p) continue;
-    if (buf.length + p.length <= maxChars) {
-      buf += p;
-    } else {
-      if (buf) result.push(buf);
-      // p 自体が長い場合はさらに文字数で分割
-      let rem = p;
-      while (rem.length > maxChars) {
-        result.push(rem.slice(0, maxChars));
-        rem = rem.slice(maxChars);
-      }
-      buf = rem;
+  for (const char of text) {
+    buf += char;
+    const isPunct    = PUNCT.has(char);
+    const isParticle = PARTICLES.has(char) && buf.length >= 4;
+    const isFull     = buf.length >= maxChars;
+
+    if (isPunct || isParticle || isFull) {
+      const chunk = buf.trim();
+      if (chunk) result.push(chunk);
+      buf = "";
     }
   }
-  if (buf) result.push(buf);
+  if (buf.trim()) result.push(buf.trim());
   return result.filter(Boolean);
 }
 
@@ -1068,7 +1215,7 @@ function buildPhraseTimeline(subtitles, audioDuration) {
     if (secDur <= 0) continue;
 
     // フックは少し長めのフレーズでもOK（インパクト重視）
-    const maxChars = sub.label === "フック" ? 16 : 10;
+    const maxChars = sub.label === "フック" ? 15 : 15;
     const chunks = splitIntoPhrases(sub.text, maxChars);
     if (chunks.length === 0) continue;
 
@@ -1106,13 +1253,14 @@ async function main() {
     : null;
 
   const steps = [
-    { num: 1,         fn: step1_fetchCandidates,       name: "実験テーマの取得" },
+    { num: 1,         fn: step1_fetchCandidates,       name: "海外動画収集" },
     { num: 2,         fn: step2_generateExplanation,   name: "深掘り解説生成" },
     { num: 3,         fn: step3_generateScript,        name: "台本生成" },
     { num: 4,         fn: step4_generateAudio,         name: "音声生成" },
     { num: "whisper", fn: stepWhisper_alignAudio,      name: "音声タイミング解析" },
     { num: "bg",      fn: stepBg_fetchBackgroundVideo, name: "背景動画生成" },
     { num: "sfx",     fn: stepSfx_fetchSoundEffects,   name: "効果音取得" },
+    { num: "bgm",     fn: stepBgm_fetchBGM,            name: "BGM取得" },
     { num: 5,         fn: step5_renderVideo,           name: "動画レンダリング" },
   ];
 
@@ -1123,7 +1271,7 @@ async function main() {
   if (stepsToRun.length === 0) {
     console.error(
       `ステップ "${targetStep}" は存在しません。\n` +
-      `有効な値: 1, 2, 3, 4, whisper, bg, sfx, 5`
+      `有効な値: 1, 2, 3, 4, whisper, bg, sfx, bgm, 5`
     );
     process.exit(1);
   }
