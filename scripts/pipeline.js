@@ -530,8 +530,8 @@ async function stepWhisper_alignAudio() {
 
   const whisperScript = path.join(ROOT, "scripts", "whisper_align.py");
 
-  // Python コマンド（Windows: py / mac+linux: python3 を優先）
-  const pythonCmd = process.platform === "win32" ? "py" : "python3";
+  // Python コマンド（Windows: python / mac+linux: python3 を優先）
+  const pythonCmd = process.platform === "win32" ? "python" : "python3";
 
   await withRetry(
     () => {
