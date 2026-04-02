@@ -51,21 +51,30 @@ export const VideoComposition = ({
 
   // ---- フェードイン・アウト ----
   const FADE = 4; // フェードのフレーム数
+
+  // フレーズが短すぎてFADE*2を下回る場合はフェードをスキップ（opacity固定1）
+  const canFade = phraseDurFrames > FADE * 2;
   const opacity = currentPhrase
-    ? interpolate(
-        localFrame,
-        [0, FADE, phraseDurFrames - FADE, phraseDurFrames],
-        [0, 1, 1, 0],
-        { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
-      )
+    ? canFade
+      ? interpolate(
+          localFrame,
+          [0, FADE, phraseDurFrames - FADE, phraseDurFrames],
+          [0, 1, 1, 0],
+          { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
+        )
+      : 1
     : 0;
 
   // ---- スケールアニメーション（フレーズ切り替わり時に少し拡大→通常サイズ） ----
+  // フレーズがFADE以上ある場合のみ適用
+  const canScale = phraseDurFrames > FADE;
   const scale = currentPhrase
-    ? interpolate(localFrame, [0, FADE], [isHook ? 1.12 : 0.90, 1.0], {
-        extrapolateLeft: "clamp",
-        extrapolateRight: "clamp",
-      })
+    ? canScale
+      ? interpolate(localFrame, [0, FADE], [isHook ? 1.12 : 0.90, 1.0], {
+          extrapolateLeft: "clamp",
+          extrapolateRight: "clamp",
+        })
+      : 1
     : 1;
 
   // フック: 大きなフォント・画面中央  /  それ以外: やや小さめ・中央より下
