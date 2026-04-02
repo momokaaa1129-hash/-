@@ -1,180 +1,161 @@
 import {
   AbsoluteFill,
   Audio,
+  Video,
   staticFile,
   useCurrentFrame,
   useVideoConfig,
-  spring,
   interpolate,
 } from "remotion";
 
 // ---- 定数 ----
-// セーフゾーン（上下15%）
-const SAFE_ZONE_RATIO = 0.15;
-
-// フォント（日本語対応・OSごとのフォールバック）
+const SAFE_ZONE_RATIO = 0.15; // 上下15%のセーフゾーン
 const FONT_FAMILY =
   '"Hiragino Sans", "Yu Gothic UI", "Meiryo", "Noto Sans JP", sans-serif';
 
 // ---- メインコンポーネント ----
-// props:
-//   subtitles      ... [{label, start, end, text}] の配列
-//   hasBgm         ... BGMファイルがあればtrue
+// props（pipeline.js の step5 から渡される）:
+//   phrases         ... [{text, start, end, isHook}]
+//   hasBackground   ... background.mp4 があれば true
+//   hasBgm          ... bgm.mp3 があれば true
 //   durationInSeconds ... 動画の秒数
 
-export const VideoComposition = ({ subtitles, hasBgm, durationInSeconds }) => {
+export const VideoComposition = ({
+  phrases,
+  hasBackground,
+  hasBgm,
+  durationInSeconds,
+}) => {
   const frame = useCurrentFrame();
-  const { fps, width, height } = useVideoConfig();
+  const { fps, height } = useVideoConfig();
 
   const currentTime = frame / fps;
-  const safeY = height * SAFE_ZONE_RATIO; // 上下セーフゾーン = 288px
+  const safeY = height * SAFE_ZONE_RATIO; // = 288px
 
-  // 現在の時刻に対応する字幕を取得
-  const currentSub = (subtitles ?? []).find(
-    (s) => currentTime >= s.start && currentTime < s.end
+  // 現在表示するフレーズを探す
+  const allPhrases = phrases ?? [];
+  const currentIdx = allPhrases.findIndex(
+    (p) => currentTime >= p.start && currentTime < p.end
   );
+  const currentPhrase = currentIdx >= 0 ? allPhrases[currentIdx] : null;
+  const isHook = currentPhrase?.isHook ?? false;
 
-  const isHook = currentSub?.label === "フック";
+  // フレーズの先頭フレームからのローカルフレーム数（アニメーション計算用）
+  const phraseStartFrame = currentPhrase
+    ? Math.round(currentPhrase.start * fps)
+    : 0;
+  const phraseDurFrames = currentPhrase
+    ? Math.max(2, Math.round((currentPhrase.end - currentPhrase.start) * fps))
+    : 1;
+  const localFrame = frame - phraseStartFrame;
+
+  // ---- フェードイン・アウト ----
+  const FADE = 4; // フェードのフレーム数
+  const opacity = currentPhrase
+    ? interpolate(
+        localFrame,
+        [0, FADE, phraseDurFrames - FADE, phraseDurFrames],
+        [0, 1, 1, 0],
+        { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
+      )
+    : 0;
+
+  // ---- スケールアニメーション（フレーズ切り替わり時に少し拡大→通常サイズ） ----
+  const scale = currentPhrase
+    ? interpolate(localFrame, [0, FADE], [isHook ? 1.12 : 0.90, 1.0], {
+        extrapolateLeft: "clamp",
+        extrapolateRight: "clamp",
+      })
+    : 1;
+
+  // フック: 大きなフォント・画面中央  /  それ以外: やや小さめ・中央より下
+  const fontSize = isHook ? 92 : 56;
+  const overlayAlpha = isHook ? 0.72 : 0.45;
 
   return (
     <AbsoluteFill>
-      {/* 背景グラデーション */}
-      <AbsoluteFill
-        style={{
-          background:
-            "radial-gradient(ellipse at 50% 40%, #1a1a3e 0%, #0a0a14 60%, #000 100%)",
-        }}
-      />
-
-      {/* ナレーション音声（フルタイム再生） */}
-      <Audio src={staticFile("narration.mp3")} />
-
-      {/* BGM（存在する場合のみ・音量20%） */}
-      {hasBgm && (
-        <Audio src={staticFile("bgm.mp3")} volume={0.2} />
+      {/* ── 背景 ── */}
+      {hasBackground ? (
+        <AbsoluteFill>
+          <Video
+            src={staticFile("background.mp4")}
+            style={{ width: "100%", height: "100%", objectFit: "cover" }}
+            muted
+            loop
+          />
+        </AbsoluteFill>
+      ) : (
+        /* 背景動画がない場合のフォールバックグラデーション */
+        <AbsoluteFill
+          style={{
+            background:
+              "radial-gradient(ellipse at 50% 40%, #1a1a3e 0%, #0a0a14 60%, #000 100%)",
+          }}
+        />
       )}
 
-      {/* セーフゾーンガイド用ラッパー（上下15%内側に収める） */}
+      {/* ── 暗いオーバーレイ（背景動画の上に乗せて文字を読みやすくする） ── */}
       <AbsoluteFill
-        style={{
-          paddingTop: safeY,
-          paddingBottom: safeY,
-          paddingLeft: 40,
-          paddingRight: 40,
-        }}
-      >
-        {/* フック（0〜3秒）：画面中央に大きく表示してスケールイン */}
-        {isHook && (
-          <HookText frame={frame} fps={fps} text={currentSub.text} />
-        )}
+        style={{ backgroundColor: `rgba(0,0,0,${overlayAlpha})` }}
+      />
 
-        {/* 紹介・解説・締め：画面下部に字幕バーとして表示 */}
-        {!isHook && currentSub && (
-          <SubtitleBar
-            frame={frame}
-            fps={fps}
-            text={currentSub.text}
-            label={currentSub.label}
-          />
-        )}
-      </AbsoluteFill>
-    </AbsoluteFill>
-  );
-};
+      {/* ── ナレーション音声 ── */}
+      <Audio src={staticFile("narration.mp3")} />
 
-// ---- フックテキスト（中央・大きく・スケールイン） ----
-const HookText = ({ frame, fps, text }) => {
-  // 0フレームから springアニメーションでスケールイン
-  const scale = spring({
-    frame,
-    fps,
-    config: { damping: 14, stiffness: 120, mass: 0.8 },
-    from: 0.6,
-    to: 1,
-  });
+      {/* ── BGM（音量18%） ── */}
+      {hasBgm && <Audio src={staticFile("bgm.mp3")} volume={0.18} />}
 
-  const opacity = interpolate(frame, [0, 8], [0, 1], {
-    extrapolateRight: "clamp",
-  });
-
-  return (
-    <AbsoluteFill
-      style={{
-        justifyContent: "center",
-        alignItems: "center",
-      }}
-    >
-      <div
-        style={{
-          color: "#ffffff",
-          fontSize: 88,
-          fontWeight: 900,
-          fontFamily: FONT_FAMILY,
-          textAlign: "center",
-          lineHeight: 1.35,
-          letterSpacing: "0.02em",
-          transform: `scale(${scale})`,
-          opacity,
-          textShadow: "0 0 40px rgba(100, 140, 255, 0.6), 0 4px 16px rgba(0,0,0,0.9)",
-          // テキストに縁取り（白文字 + 黒縁）
-          WebkitTextStroke: "2px rgba(0,0,0,0.4)",
-        }}
-      >
-        {text}
-      </div>
-    </AbsoluteFill>
-  );
-};
-
-// ---- 字幕バー（画面下部） ----
-const SubtitleBar = ({ frame, fps, text, label }) => {
-  // セクションが切り替わるたびにフェードイン
-  // frame=0 から数えているわけではないので、
-  // セクション開始からのローカルフレームはpropsで渡さず、
-  // 簡易的にグローバルフレームで代用する（短いフェードで十分）
-  const opacity = interpolate(frame % (fps * 3), [0, 8], [0.6, 1], {
-    extrapolateRight: "clamp",
-    extrapolateLeft: "clamp",
-  });
-
-  // 締めのみ少し大きめにして印象を変える
-  const isEnding = label === "締め";
-  const fontSize = isEnding ? 56 : 50;
-
-  return (
-    <AbsoluteFill
-      style={{
-        justifyContent: "flex-end",
-        alignItems: "center",
-      }}
-    >
-      <div
-        style={{
-          opacity,
-          backgroundColor: "rgba(0, 0, 0, 0.72)",
-          borderRadius: 20,
-          padding: "22px 44px",
-          maxWidth: "100%",
-          backdropFilter: "blur(8px)",
-          border: "1px solid rgba(255,255,255,0.08)",
-        }}
-      >
-        <p
+      {/* ── フレーズ字幕 ── */}
+      {currentPhrase && (
+        <AbsoluteFill
           style={{
-            color: "#ffffff",
-            fontSize,
-            fontWeight: 700,
-            fontFamily: FONT_FAMILY,
-            textAlign: "center",
-            lineHeight: 1.6,
-            letterSpacing: "0.03em",
-            margin: 0,
-            textShadow: "0 2px 8px rgba(0,0,0,0.8)",
+            // フック = 画面中央、それ以外 = 下寄り（セーフゾーン内）
+            justifyContent: isHook ? "center" : "flex-end",
+            alignItems: "center",
+            paddingBottom: isHook ? 0 : safeY + 40,
+            paddingLeft: 40,
+            paddingRight: 40,
           }}
         >
-          {text}
-        </p>
-      </div>
+          <div
+            style={{
+              transform: `scale(${scale})`,
+              opacity,
+              textAlign: "center",
+              // フックのみ半透明背景で囲む
+              ...(isHook
+                ? {
+                    background: "rgba(0,0,0,0.3)",
+                    borderRadius: 24,
+                    padding: "24px 48px",
+                  }
+                : {}),
+            }}
+          >
+            <span
+              style={{
+                display: "block",
+                color: "#ffffff",
+                fontSize,
+                fontWeight: 900,
+                fontFamily: FONT_FAMILY,
+                lineHeight: 1.45,
+                letterSpacing: "0.04em",
+                // 黒い縁取り（4方向のtextShadow）
+                textShadow: [
+                  "-3px -3px 0 #000",
+                  " 3px -3px 0 #000",
+                  "-3px  3px 0 #000",
+                  " 3px  3px 0 #000",
+                  "0 0 24px rgba(0,0,0,0.9)",
+                ].join(", "),
+              }}
+            >
+              {currentPhrase.text}
+            </span>
+          </div>
+        </AbsoluteFill>
+      )}
     </AbsoluteFill>
   );
 };

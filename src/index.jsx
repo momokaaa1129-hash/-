@@ -18,8 +18,9 @@ const RemotionRoot = () => {
         durationInFrames: Math.round((props.durationInSeconds ?? 60) * 30),
       })}
       defaultProps={{
-        subtitles: [],   // [{label, start, end, text}] の配列
-        hasBgm: false,   // BGMファイルがあればtrue
+        phrases: [],          // [{text, start, end, isHook}] フレーズタイムライン
+        hasBackground: false, // background.mp4 があれば true
+        hasBgm: false,        // bgm.mp3 があれば true
         durationInSeconds: 60,
       }}
     />

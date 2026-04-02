@@ -27,14 +27,16 @@ const ROOT = path.resolve(__dirname, "..");
 
 // ---- パス定数 ----
 const PATHS = {
-  styleGuide: path.join(ROOT, "style_guide.md"),
-  candidates: path.join(ROOT, "output", "scripts", "candidates.json"),
+  styleGuide:  path.join(ROOT, "style_guide.md"),
+  candidates:  path.join(ROOT, "output", "scripts", "candidates.json"),
   explanation: path.join(ROOT, "output", "scripts", "explanation.json"),
-  script: path.join(ROOT, "output", "scripts", "script.txt"),
-  audio: path.join(ROOT, "output", "audio", "narration.mp3"),
-  video: path.join(ROOT, "output", "videos", "final.mp4"),
-  bgm: path.join(ROOT, "output", "assets", "bgm.mp3"),
-  errorLog: path.join(ROOT, "output", "error_log.txt"),
+  script:      path.join(ROOT, "output", "scripts", "script.txt"),
+  audio:       path.join(ROOT, "output", "audio", "narration.mp3"),
+  video:       path.join(ROOT, "output", "videos", "final.mp4"),
+  bgm:         path.join(ROOT, "output", "assets", "bgm.mp3"),
+  background:  path.join(ROOT, "output", "assets", "background.mp4"),
+  clips:       path.join(ROOT, "output", "assets", "clips"),
+  errorLog:    path.join(ROOT, "output", "error_log.txt"),
 };
 
 // ---- ユーティリティ ----
@@ -440,6 +442,130 @@ async function step4_generateAudio() {
 }
 
 /**
+ * ステップBG: YouTube動画から背景クリップを生成し background.mp4 に保存する。
+ *
+ * 前提ツール（要インストール）:
+ *   pip install yt-dlp
+ *   ffmpeg （PATH に通しておくこと）
+ */
+async function stepBg_fetchBackgroundVideo() {
+  console.log("\n=== ステップBG: 背景動画の生成 ===");
+
+  // yt-dlp / ffmpeg の存在確認
+  for (const [cmd, hint] of [
+    ["yt-dlp --version", "pip install yt-dlp"],
+    ["ffmpeg -version",  "https://ffmpeg.org/download.html"],
+  ]) {
+    try {
+      execSync(cmd, { stdio: "pipe" });
+    } catch {
+      throw new Error(
+        `${cmd.split(" ")[0]} が見つかりません。\n  インストール: ${hint}`
+      );
+    }
+  }
+
+  // explanation.json からキーワード取得
+  if (!fs.existsSync(PATHS.explanation)) {
+    throw new Error(
+      "explanation.json が見つかりません。先にステップ2を実行してください。"
+    );
+  }
+  const explanation = readJson(PATHS.explanation);
+  const searchQuery = explanation.selected.title
+    .replace(/["""''「」【】（）()]/g, "")
+    .trim();
+  console.log(`  検索クエリ: "${searchQuery}"`);
+
+  // ---- yt-dlp で動画IDを検索 ----
+  let videoIds;
+  await withRetry(() => {
+    const raw = execSync(
+      `yt-dlp "ytsearch8:${searchQuery} experiment" --flat-playlist --print id --no-warnings`,
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }
+    );
+    videoIds = raw.trim().split(/\r?\n/).filter(Boolean).slice(0, 8);
+    if (videoIds.length === 0) throw new Error("検索結果が0件でした");
+  }, 3, "stepBg-search");
+  console.log(`  ${videoIds.length} 件の動画IDを取得`);
+
+  // ---- 各動画から5秒クリップをダウンロード＋縦型変換 ----
+  fs.mkdirSync(PATHS.clips, { recursive: true });
+  const processedClips = [];
+
+  for (let i = 0; i < videoIds.length && processedClips.length < 6; i++) {
+    const vid = videoIds[i];
+    // 出力先（拡張子は yt-dlp が決める）
+    const rawPattern = path.join(PATHS.clips, `raw_${i}.%(ext)s`).replace(/\\/g, "/");
+    const processedClip = path.join(PATHS.clips, `clip_${i}.mp4`);
+
+    try {
+      // yt-dlp: 最初の5秒だけダウンロード（ffmpegが必要）
+      execSync(
+        `yt-dlp -f "best[height<=720]" --download-sections "*0-5" ` +
+          `--no-part --no-continue --no-warnings ` +
+          `-o "${rawPattern}" ` +
+          `"https://www.youtube.com/watch?v=${vid}"`,
+        { stdio: "pipe", timeout: 60000 }
+      );
+
+      // ダウンロードされた実ファイルを探す
+      const rawFile = fs
+        .readdirSync(PATHS.clips)
+        .find((f) => f.startsWith(`raw_${i}.`));
+      if (!rawFile) continue;
+      const rawPath = path.join(PATHS.clips, rawFile);
+
+      // ffmpeg: 縦型1080x1920に変換・5秒・音声除去
+      execSync(
+        `ffmpeg -y -i "${rawPath}" -t 5 ` +
+          `-vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30" ` +
+          `-c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -an ` +
+          `"${processedClip}"`,
+        { stdio: "pipe", timeout: 90000 }
+      );
+
+      if (fs.existsSync(processedClip) && fs.statSync(processedClip).size > 1000) {
+        processedClips.push(processedClip);
+        console.log(`  ✓ クリップ${processedClips.length} (${vid})`);
+      }
+      // rawファイルを削除
+      try { fs.unlinkSync(rawPath); } catch { /* ignore */ }
+    } catch (err) {
+      console.warn(`  ⚠ ${vid} をスキップ: ${err.message.slice(0, 80)}`);
+    }
+  }
+
+  if (processedClips.length === 0) {
+    throw new Error(
+      "有効なクリップを1件も取得できませんでした。\n" +
+        "  - yt-dlp と ffmpeg が正しくインストールされているか確認してください\n" +
+        "  - ネットワーク接続を確認してください"
+    );
+  }
+
+  // ---- ffmpeg でクリップを結合 ----
+  const concatList = path.join(PATHS.clips, "concat_list.txt");
+  fs.writeFileSync(
+    concatList,
+    processedClips.map((p) => `file '${p.replace(/\\/g, "/")}'`).join("\n"),
+    "utf-8"
+  );
+
+  ensureDir(PATHS.background);
+  execSync(
+    `ffmpeg -y -f concat -safe 0 -i "${concatList}" -c copy "${PATHS.background}"`,
+    { stdio: "pipe" }
+  );
+
+  const totalSec = processedClips.length * 5;
+  console.log(
+    `✓ background.mp4 を保存しました（${processedClips.length}クリップ・約${totalSec}秒）`
+  );
+  return PATHS.background;
+}
+
+/**
  * script.txt のセクションヘッダーを解析して字幕データを返す。
  *
  * 対応フォーマット①（ヘッダーあり）:
@@ -552,11 +678,24 @@ async function step5_renderVideo() {
     console.log("  ✓ bgm.mp3 → public/");
   }
 
-  // ---- 動画の長さ = 字幕の最終終了時刻 ----
-  const durationInSeconds = Math.max(...subtitles.map((s) => s.end));
+  // ---- 背景動画（stepBg で生成済みなら使用） ----
+  const hasBackground = fs.existsSync(PATHS.background);
+  if (hasBackground) {
+    fs.copyFileSync(PATHS.background, path.join(publicDir, "background.mp4"));
+    console.log("  ✓ background.mp4 → public/");
+  }
+
+  // ---- 音声の実長を取得してフレーズタイムラインを構築 ----
+  const audioDuration = getAudioDuration(PATHS.audio);
+  const durationInSeconds = Math.min(
+    audioDuration,
+    Math.max(...subtitles.map((s) => s.end))
+  );
+  const phrases = buildPhraseTimeline(subtitles, durationInSeconds);
+  console.log(`  フレーズ総数: ${phrases.length}`);
 
   // ---- props をファイルに書き出す（Windowsでの引数エスケープ問題を回避） ----
-  const props = { subtitles, hasBgm, durationInSeconds };
+  const props = { phrases, hasBackground, hasBgm, durationInSeconds };
   const propsFile = path.join(os.tmpdir(), `remotion_props_${Date.now()}.json`);
   fs.writeFileSync(propsFile, JSON.stringify(props), "utf-8");
 
@@ -581,6 +720,88 @@ async function step5_renderVideo() {
   return PATHS.video;
 }
 
+// ---- 背景動画・字幕タイムライン用ヘルパー ----
+
+/**
+ * ffprobe で音声ファイルの長さ（秒）を取得する。
+ * ffprobe が使えない場合は 60 秒を返す。
+ */
+function getAudioDuration(audioPath) {
+  try {
+    const out = execSync(
+      `ffprobe -v quiet -print_format json -show_streams "${audioPath}"`,
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] }
+    );
+    const data = JSON.parse(out);
+    const stream = data.streams?.find((s) => s.codec_type === "audio");
+    const dur = parseFloat(stream?.duration ?? "0");
+    return dur > 0 ? dur : 60;
+  } catch {
+    console.warn("  ⚠ ffprobe で音声長を取得できませんでした（60秒で代用）");
+    return 60;
+  }
+}
+
+/**
+ * 日本語テキストを句読点・最大文字数で短いフレーズに分割する。
+ * maxChars: 1フレーズの最大文字数（デフォルト10）
+ */
+function splitIntoPhrases(text, maxChars = 10) {
+  if (!text) return [];
+  // 句点・読点・感嘆符・疑問符・改行の後ろで分割（区切り文字は前のフレーズに含める）
+  const parts = text.split(/(?<=[。、！？…\n])/);
+  const result = [];
+  let buf = "";
+
+  for (const part of parts) {
+    const p = part.trim();
+    if (!p) continue;
+    if (buf.length + p.length <= maxChars) {
+      buf += p;
+    } else {
+      if (buf) result.push(buf);
+      // p 自体が長い場合はさらに文字数で分割
+      let rem = p;
+      while (rem.length > maxChars) {
+        result.push(rem.slice(0, maxChars));
+        rem = rem.slice(maxChars);
+      }
+      buf = rem;
+    }
+  }
+  if (buf) result.push(buf);
+  return result.filter(Boolean);
+}
+
+/**
+ * 字幕セクション配列をフレーズごとのタイムラインに変換する。
+ * audioDuration: 実際の音声長（秒）。超えないようにカットする。
+ */
+function buildPhraseTimeline(subtitles, audioDuration) {
+  const timeline = [];
+  for (const sub of subtitles) {
+    const secEnd = Math.min(sub.end, audioDuration);
+    const secDur = secEnd - sub.start;
+    if (secDur <= 0) continue;
+
+    // フックは少し長めのフレーズでもOK（インパクト重視）
+    const maxChars = sub.label === "フック" ? 16 : 10;
+    const chunks = splitIntoPhrases(sub.text, maxChars);
+    if (chunks.length === 0) continue;
+
+    const timePerPhrase = secDur / chunks.length;
+    chunks.forEach((text, i) => {
+      timeline.push({
+        text,
+        start: sub.start + i * timePerPhrase,
+        end:   sub.start + (i + 1) * timePerPhrase,
+        isHook: sub.label === "フック",
+      });
+    });
+  }
+  return timeline;
+}
+
 // ---- JSON 抽出ヘルパー ----
 function extractJson(text) {
   // ```json ... ``` ブロックを取り除く
@@ -595,23 +816,30 @@ function extractJson(text) {
 async function main() {
   const args = process.argv.slice(2);
   const stepArg = args.find((a) => a.startsWith("--step="));
-  const targetStep = stepArg ? parseInt(stepArg.split("=")[1], 10) : null;
+  const stepStr = stepArg ? stepArg.split("=")[1] : null;
+  // "bg" は文字列のまま、数字は整数に変換
+  const targetStep = stepStr
+    ? stepStr === "bg" ? "bg" : parseInt(stepStr, 10)
+    : null;
 
   const steps = [
-    { num: 1, fn: step1_fetchCandidates, name: "実験テーマの取得" },
-    { num: 2, fn: step2_generateExplanation, name: "深掘り解説生成" },
-    { num: 3, fn: step3_generateScript, name: "台本生成" },
-    { num: 4, fn: step4_generateAudio, name: "音声生成" },
-    { num: 5, fn: step5_renderVideo, name: "動画レンダリング" },
+    { num: 1,    fn: step1_fetchCandidates,       name: "実験テーマの取得" },
+    { num: 2,    fn: step2_generateExplanation,   name: "深掘り解説生成" },
+    { num: 3,    fn: step3_generateScript,         name: "台本生成" },
+    { num: 4,    fn: step4_generateAudio,          name: "音声生成" },
+    { num: "bg", fn: stepBg_fetchBackgroundVideo, name: "背景動画生成" },
+    { num: 5,    fn: step5_renderVideo,            name: "動画レンダリング" },
   ];
 
-  // 実行するステップを絞り込む
-  const stepsToRun = targetStep
+  const stepsToRun = targetStep !== null
     ? steps.filter((s) => s.num === targetStep)
     : steps;
 
   if (stepsToRun.length === 0) {
-    console.error(`ステップ ${targetStep} は存在しません（1〜5）`);
+    console.error(
+      `ステップ "${targetStep}" は存在しません。\n` +
+      `有効な値: 1, 2, 3, 4, bg, 5`
+    );
     process.exit(1);
   }
 
@@ -635,9 +863,14 @@ async function main() {
   }
 
   console.log("\n✅ パイプライン完了！");
-  if (!targetStep || targetStep === 5) {
+  if (targetStep === null || targetStep === 5) {
     if (fs.existsSync(PATHS.video)) {
       console.log(`動画ファイル: ${PATHS.video}`);
+    }
+  }
+  if (targetStep === null || targetStep === "bg") {
+    if (fs.existsSync(PATHS.background)) {
+      console.log(`背景動画: ${PATHS.background}`);
     }
   }
 }
