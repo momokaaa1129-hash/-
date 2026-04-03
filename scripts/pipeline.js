@@ -32,6 +32,7 @@ const PATHS = {
   explanation: path.join(ROOT, "output", "scripts", "explanation.json"),
   script:      path.join(ROOT, "output", "scripts", "script.txt"),
   timing:      path.join(ROOT, "output", "scripts", "timing.json"),
+  srt:         path.join(ROOT, "output", "scripts", "subtitle.srt"),
   audio:       path.join(ROOT, "output", "audio", "narration.mp3"),
   video:       path.join(ROOT, "output", "videos", "final.mp4"),
   bgm:         path.join(ROOT, "output", "assets", "bgm.mp3"),
@@ -637,6 +638,26 @@ async function stepWhisper_alignAudio() {
 
   const timing = readJson(PATHS.timing);
   console.log(`✓ タイミング解析完了 (${timing.phrase_count} フレーズ)`);
+
+  // ---- SRT ファイルを生成（Filmoraなどの外部ツールで読み込める形式） ----
+  const toSrtTime = (sec) => {
+    const h   = Math.floor(sec / 3600);
+    const m   = Math.floor((sec % 3600) / 60);
+    const s   = Math.floor(sec % 60);
+    const ms  = Math.round((sec % 1) * 1000);
+    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")},${String(ms).padStart(3, "0")}`;
+  };
+
+  const srtContent = timing.phrases
+    .map((p, i) =>
+      `${i + 1}\n${toSrtTime(p.start)} --> ${toSrtTime(p.end)}\n${p.text}`
+    )
+    .join("\n\n");
+
+  // UTF-8 BOMなし で保存
+  fs.writeFileSync(PATHS.srt, srtContent, { encoding: "utf-8" });
+  console.log(`✓ subtitle.srt を保存しました (${timing.phrases.length} 件)`);
+
   return PATHS.timing;
 }
 
