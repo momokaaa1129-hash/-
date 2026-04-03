@@ -262,31 +262,52 @@ async function step1_fetchCandidates() {
     throw new Error("yt-dlp が見つかりません。\n  インストール: pip install yt-dlp");
   }
 
-  const SEARCH_QUERIES = [
-    "science experiment amazing reaction",
-    "cool chemistry experiment kids",
-    "physics experiment viral reaction",
+  // 日本語文字（ひらがな・カタカナ・漢字）を含むかどうかチェック
+  const hasJapanese = (str) => /[\u3040-\u9fff\uff00-\uffef]/.test(str);
+
+  // 優先チャンネル名 × 実験キーワードで検索
+  const CHANNEL_QUERIES = [
+    "Mark Rober experiment science",
+    "The Action Lab science experiment",
+    "NileRed chemistry experiment",
+    "SmarterEveryDay experiment",
+    "Veritasium science experiment",
   ];
+  const GENERIC_QUERIES = [
+    "elephant toothpaste experiment reaction",
+    "non newtonian fluid experiment",
+    "chain reaction science experiment",
+  ];
+  const SEARCH_QUERIES = [...CHANNEL_QUERIES, ...GENERIC_QUERIES];
 
   const seenIds = new Set();
   const videoItems = [];
 
   for (const q of SEARCH_QUERIES) {
-    if (videoItems.length >= 5) break;
+    if (videoItems.length >= 8) break;
     try {
+      // id・チャンネル名・タイトルを取得。60秒未満の動画を除外
       const raw = execSync(
-        `yt-dlp "ytsearch5:${q}" --flat-playlist --print "%(id)s\t%(title)s" --no-warnings`,
+        `yt-dlp "ytsearch8:${q}" --flat-playlist ` +
+          `--print "%(id)s\t%(channel)s\t%(title)s" ` +
+          `--match-filter "duration>=60" --no-warnings`,
         { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }
       );
       for (const line of raw.trim().split(/\r?\n/).filter(Boolean)) {
-        if (videoItems.length >= 5) break;
-        const tabIdx = line.indexOf("\t");
-        const id    = tabIdx >= 0 ? line.slice(0, tabIdx).trim() : line.trim();
-        const title = tabIdx >= 0 ? line.slice(tabIdx + 1).trim() : "";
-        if (id && !seenIds.has(id)) {
-          seenIds.add(id);
-          videoItems.push({ id, title: title || id });
+        if (videoItems.length >= 8) break;
+        const parts  = line.split("\t");
+        const id      = parts[0]?.trim();
+        const channel = parts[1]?.trim() ?? "";
+        const title   = parts.slice(2).join("\t").trim();
+
+        if (!id || seenIds.has(id)) continue;
+        // 日本語チャンネル・日本語タイトルを除外
+        if (hasJapanese(channel) || hasJapanese(title)) {
+          console.log(`  ⊘ 日本語チャンネルをスキップ: ${channel} / ${title.slice(0, 30)}`);
+          continue;
         }
+        seenIds.add(id);
+        videoItems.push({ id, channel, title: title || id });
       }
     } catch (err) {
       console.warn(`  ⚠ "${q}" の検索をスキップ: ${err.message.slice(0, 60)}`);
@@ -298,7 +319,7 @@ async function step1_fetchCandidates() {
   }
 
   console.log(`  ${videoItems.length} 件の動画を取得しました`);
-  videoItems.forEach((v) => console.log(`    - [${v.id}] ${v.title}`));
+  videoItems.forEach((v) => console.log(`    - [${v.id}] [${v.channel}] ${v.title}`));
 
   // Gemini がタイトルを分析し「何の実験か」を把握、最もバズりそうな1件を選ぶ
   const videoList = videoItems
@@ -462,7 +483,8 @@ async function step3_generateScript() {
   const styleGuide = fs.readFileSync(PATHS.styleGuide, "utf-8");
 
   const prompt = `
-以下のスタイルガイドを**厳守**して、YouTube Shorts用の60秒台本を生成してください。
+以下のスタイルガイドを**厳守**して、YouTube Shorts用の**45秒以内**の台本を生成してください。
+ショート動画なので、簡潔さ最優先。各セクションを短くまとめてください。
 
 === スタイルガイド ===
 ${styleGuide}
@@ -472,33 +494,33 @@ ${JSON.stringify(explanation, null, 2)}
 
 === 台本の流れ（厳守） ===
 この動画で「何が起きているか」を視聴者が理解できるよう、以下の流れで構成すること:
-  フック    → 「なぜこうなるの？」という疑問・驚きで視聴者を掴む
-  紹介      → 「実はこういう現象なんだ」と現象を紹介
-  解説      → 「仕組みはこうだよ」と科学的に説明
-  締め      → 「日常でも〇〇に使われてる」と身近な例で締める
+  フック    → 「なぜこうなるの？」という疑問・驚きで視聴者を掴む（短く・インパクト重視）
+  紹介      → 「実はこういう現象なんだ」と現象名だけ端的に
+  解説      → 「仕組みはこうだよ」を2〜3文で完結させる
+  締め      → 「日常でも〇〇に使われてる」を1文で締める
 
 === 出力形式（厳守） ===
-必ず以下の形式で出力すること。セクションヘッダー行（[フック: 0〜3秒] など）は**必ず残す**こと。ヘッダーを省略しないこと。
+必ず以下の形式で出力すること。セクションヘッダー行は**必ず残す**こと。
 
 [フック: 0〜3秒]
-ここにフックのテキスト（30字以内の問いかけ or 驚き表現）
+ここにフックのテキスト（15字以内の問いかけ or 驚き表現）
 
-[紹介: 3〜15秒]
-ここに紹介のテキスト（実験名・概要、80字以内）
+[紹介: 3〜10秒]
+ここに紹介のテキスト（実験名・現象名のみ、30字以内）
 
-[解説: 15〜50秒]
-ここに解説のテキスト（科学的仕組み・日常例・豆知識、200字以内）
+[解説: 10〜40秒]
+ここに解説のテキスト（科学的仕組みを2〜3文、80字以内）
 
-[締め: 50〜60秒]
-ここに締めのテキスト（日常への繋がり・知識の余韻、60字以内）
+[締め: 40〜45秒]
+ここに締めのテキスト（日常との繋がり1文、20字以内）
 
 注意：
 - セクションヘッダー（[フック: 0〜3秒] 等）は必ずそのまま出力すること
 - 各セクションの（...）の説明文は出力しないこと。台本テキストのみ書くこと
 - スタイルガイドの禁止表現を一切使わないこと
 - フェニックスの口調で書くこと
-- 読みが複数ある漢字や専門用語は、テキスト音声合成（TTS）での誤読を防ぐため
-  直接ひらがなで書くこと
+- 字数制限を**必ず守ること**（短すぎるくらいがちょうどいい）
+- 読みが複数ある漢字や専門用語はひらがなで書くこと
   例：酸素 → さんそ、触媒 → しょくばい、泡 → あわ、炎 → ほのお
 `;
 
@@ -770,24 +792,35 @@ async function stepBg_fetchBackgroundVideo() {
   }
   console.log(`  合計 ${allVideoIds.length} 件のYouTube ID（重複排除済み）`);
 
+  // ナレーション長に合わせた背景動画を生成する
+  // narration.mp3 が存在すれば実長を取得、なければ 45秒で代用
+  const narrationDur = fs.existsSync(PATHS.audio) ? getAudioDuration(PATHS.audio) : 45;
+  const targetBgDur  = Math.ceil(narrationDur) + 3; // +3s バッファ
+  console.log(`  目標背景動画長: ${targetBgDur}秒（ナレーション ${narrationDur.toFixed(1)}秒）`);
+
   // ---- クリップ変換ヘルパー ----
   fs.mkdirSync(PATHS.clips, { recursive: true });
-  const processedClips = [];
-  let clipIndex = 0;
+  const processedClips = [];  // path string[]
+  let clipIndex    = 0;
+  let totalClipDur = 0;       // 確保済みの合計秒数
 
-  /** rawファイルをffmpegで縦型1080x1920・5秒に変換してprocessedClipsに追加 */
-  function processRawClip(rawPath, label) {
+  /**
+   * rawファイルをffmpegで縦型1080x1920に変換してprocessedClipsに追加。
+   * clipDur: 取り出す長さ（秒）
+   */
+  function processRawClip(rawPath, label, clipDur) {
     const processed = path.join(PATHS.clips, `clip_${clipIndex}.mp4`);
     try {
       execSync(
-        `ffmpeg -y -i "${rawPath}" -t 5 ` +
+        `ffmpeg -y -i "${rawPath}" -t ${clipDur} ` +
           `-vf "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30" ` +
           `-c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -an "${processed}"`,
-        { stdio: "pipe", timeout: 90000 }
+        { stdio: "pipe", timeout: 120000 }
       );
       if (fs.existsSync(processed) && fs.statSync(processed).size > 5000) {
         processedClips.push(processed);
-        console.log(`  ✓ クリップ${processedClips.length} [${label}]`);
+        totalClipDur += clipDur;
+        console.log(`  ✓ クリップ${processedClips.length} [${label}] ${clipDur}秒（累計 ${totalClipDur}秒）`);
         clipIndex++;
         return true;
       }
@@ -800,10 +833,14 @@ async function stepBg_fetchBackgroundVideo() {
 
   // ---- YouTube クリップ ----
   for (const vid of allVideoIds) {
-    if (processedClips.length >= 6) break;
-    // オープニングをスキップするため開始位置を 30〜60 秒後にランダム設定
-    const startSec = Math.floor(Math.random() * 31) + 30;
-    const endSec   = startSec + 5;
+    if (totalClipDur >= targetBgDur) break;
+
+    // 不足分に合わせてクリップ長を決定（10〜30秒のランダム）
+    const remaining = targetBgDur - totalClipDur;
+    const clipDur   = Math.max(10, Math.min(30, remaining + 5));
+    // 冒頭30秒をスキップしてランダムな位置から取得
+    const startSec  = Math.floor(Math.random() * 31) + 30;
+    const endSec    = startSec + clipDur + 5; // ダウンロードは少し長めに
     const rawPattern = path.join(PATHS.clips, `raw_yt_${clipIndex}.%(ext)s`).replace(/\\/g, "/");
     try {
       execSync(
@@ -812,10 +849,10 @@ async function stepBg_fetchBackgroundVideo() {
           `--match-filter "!subtitles" ` +
           `--no-part --no-continue --no-warnings -o "${rawPattern}" ` +
           `"https://www.youtube.com/watch?v=${vid}"`,
-        { stdio: "pipe", timeout: 60000 }
+        { stdio: "pipe", timeout: 120000 }
       );
       const rawFile = fs.readdirSync(PATHS.clips).find((f) => f.startsWith(`raw_yt_${clipIndex}.`));
-      if (rawFile) processRawClip(path.join(PATHS.clips, rawFile), vid);
+      if (rawFile) processRawClip(path.join(PATHS.clips, rawFile), vid, clipDur);
     } catch (err) {
       console.warn(`  ⚠ YouTube ${vid} をスキップ: ${err.message.slice(0, 60)}`);
     }
@@ -823,14 +860,16 @@ async function stepBg_fetchBackgroundVideo() {
 
   // ---- Pexels クリップ ----
   for (const { id, url } of pexelsClipUrls) {
-    if (processedClips.length >= 8) break;
-    const rawPath = path.join(PATHS.clips, `raw_px_${clipIndex}.mp4`);
+    if (totalClipDur >= targetBgDur) break;
+    const remaining = targetBgDur - totalClipDur;
+    const clipDur   = Math.max(10, Math.min(20, remaining + 5));
+    const rawPath   = path.join(PATHS.clips, `raw_px_${clipIndex}.mp4`);
     try {
       execSync(
         `curl -sS -k -L -o "${rawPath}" "${url}"`,
         { stdio: "pipe", timeout: 60000 }
       );
-      if (fs.existsSync(rawPath)) processRawClip(rawPath, id);
+      if (fs.existsSync(rawPath)) processRawClip(rawPath, id, clipDur);
     } catch (err) {
       console.warn(`  ⚠ Pexels ${id} をスキップ: ${err.message.slice(0, 60)}`);
     }
@@ -844,7 +883,7 @@ async function stepBg_fetchBackgroundVideo() {
     );
   }
 
-  // ---- ffmpeg でクリップを結合 ----
+  // ---- ffmpeg でクリップを結合し、ナレーション長に合わせてカット ----
   const concatList = path.join(PATHS.clips, "concat_list.txt");
   fs.writeFileSync(
     concatList,
@@ -852,12 +891,14 @@ async function stepBg_fetchBackgroundVideo() {
     "utf-8"
   );
   ensureDir(PATHS.background);
+  // -t narrationDur で正確にナレーション長に揃える
   execSync(
-    `ffmpeg -y -f concat -safe 0 -i "${concatList}" -c copy "${PATHS.background}"`,
+    `ffmpeg -y -f concat -safe 0 -i "${concatList}" ` +
+      `-t ${narrationDur.toFixed(3)} -c copy "${PATHS.background}"`,
     { stdio: "pipe" }
   );
 
-  console.log(`✓ background.mp4 を保存しました（${processedClips.length}クリップ）`);
+  console.log(`✓ background.mp4 を保存しました（${processedClips.length}クリップ / ${narrationDur.toFixed(1)}秒）`);
   return PATHS.background;
 }
 
@@ -1048,9 +1089,9 @@ function parseScriptToSubtitles(scriptText) {
   // Geminiがヘッダーを省略してテキストだけ出力した場合のフォールバック
   const DEFAULT_TIMING = [
     { label: "フック", start: 0,  end: 3  },
-    { label: "紹介",  start: 3,  end: 15 },
-    { label: "解説",  start: 15, end: 50 },
-    { label: "締め",  start: 50, end: 60 },
+    { label: "紹介",  start: 3,  end: 10 },
+    { label: "解説",  start: 10, end: 40 },
+    { label: "締め",  start: 40, end: 45 },
   ];
 
   const paragraphs = scriptText
