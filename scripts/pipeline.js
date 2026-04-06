@@ -9,6 +9,7 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
+import readline from "readline";
 import { execSync } from "child_process";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
@@ -39,8 +40,14 @@ const PATHS = {
   background:  path.join(ROOT, "output", "assets", "background.mp4"),
   clips:       path.join(ROOT, "output", "assets", "clips"),
   sfxDir:      path.join(ROOT, "output", "assets", "sfx"),
+  feedback:    path.join(ROOT, "output", "scripts", "feedback.json"),
+  filmoraDir:  path.join(ROOT, "output", "filmora"),
   errorLog:    path.join(ROOT, "output", "error_log.txt"),
 };
+
+// ---- モードフラグ ----
+// --no-approval を渡すと承認プロンプトをスキップ（バッチ実行用）
+let APPROVAL_MODE = true;
 
 // ---- ユーティリティ ----
 
@@ -199,6 +206,123 @@ function convertKanjiForTTS(text) {
     result = result.replaceAll(kanji, reading);
   }
   return result;
+}
+
+// ---- 承認フロー・フィードバック学習 ----
+
+/**
+ * ターミナルからユーザー入力を1行受け取る。
+ */
+function ask(question) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+/** feedback.json を読み込む（存在しなければ空の構造を返す） */
+function readFeedback() {
+  if (!fs.existsSync(PATHS.feedback)) {
+    return { approved: [], rejected: [], style_rules: [] };
+  }
+  try {
+    return readJson(PATHS.feedback);
+  } catch {
+    return { approved: [], rejected: [], style_rules: [] };
+  }
+}
+
+/** feedback.json に書き込む */
+function saveFeedback(data) {
+  writeJson(PATHS.feedback, data);
+}
+
+/**
+ * フィードバックをプロンプトに注入する文字列を生成する。
+ * rejectedReason: 今回の再生成理由（最初の生成時は空文字）
+ */
+function buildFeedbackPrompt(feedback, rejectedReason = "") {
+  const parts = [];
+
+  if (feedback.style_rules?.length > 0) {
+    parts.push(
+      "スタイルルール（必ず守ること）:\n" +
+        feedback.style_rules.map((r) => `  - ${r}`).join("\n")
+    );
+  }
+
+  const approvedReasons = feedback.approved
+    .slice(-3)
+    .map((a) => a.reason)
+    .filter((r) => r && !/^ok$/i.test(r));
+  if (approvedReasons.length > 0) {
+    parts.push(
+      "過去にOKだった特徴:\n" +
+        approvedReasons.map((r) => `  - ${r}`).join("\n")
+    );
+  }
+
+  const rejectedReasons = feedback.rejected
+    .slice(-3)
+    .map((r) => r.reason)
+    .filter(Boolean);
+  if (rejectedReasons.length > 0) {
+    parts.push(
+      "過去にNGだった理由（必ず避けること）:\n" +
+        rejectedReasons.map((r) => `  - ${r}`).join("\n")
+    );
+  }
+
+  if (rejectedReason) {
+    parts.push(`今回の修正ポイント:\n  - ${rejectedReason}`);
+  }
+
+  if (parts.length === 0) return "";
+  return (
+    "\n=== 過去のフィードバック（優先して参考にすること） ===\n" +
+    parts.join("\n\n") +
+    "\n"
+  );
+}
+
+/**
+ * approved/rejected が合計5件以上たまったら
+ * Gemini で共通パターンを抽出して style_rules を更新する。
+ */
+async function autoUpdateStyleRules(feedback) {
+  const total = feedback.approved.length + feedback.rejected.length;
+  if (total < 5) return feedback.style_rules;
+
+  const approvedReasons = feedback.approved.map((a) => a.reason).filter(Boolean);
+  const rejectedReasons = feedback.rejected.map((r) => r.reason).filter(Boolean);
+
+  const prompt = `
+以下は「セカイノカガク」チャンネルの台本に対するユーザーフィードバックです。
+
+OKだった理由: ${approvedReasons.join(" / ") || "（なし）"}
+NGだった理由: ${rejectedReasons.join(" / ") || "（なし）"}
+
+このフィードバックから「台本作成の共通ルール」を3〜5個導き出してください。
+出力: JSON文字列配列のみ（コードブロック不要）。例: ["最初の1文でインパクトを出す", "専門用語は使わない"]
+`;
+
+  try {
+    const raw = callGemini({ model: "gemini-2.5-flash", prompt });
+    const parsed = JSON.parse(extractJson(raw));
+    if (Array.isArray(parsed)) {
+      console.log(`  ✓ スタイルルールを${parsed.length}件に自動更新しました`);
+      return parsed;
+    }
+  } catch {
+    console.warn("  ⚠ スタイルルールの自動生成をスキップ");
+  }
+  return feedback.style_rules;
 }
 
 // ---- Gemini API ヘルパー ----
@@ -482,10 +606,25 @@ async function step3_generateScript() {
   const explanation = readJson(PATHS.explanation);
   const styleGuide = fs.readFileSync(PATHS.styleGuide, "utf-8");
 
-  const prompt = `
+  // フィードバック読み込み
+  let feedback = readFeedback();
+  let rejectedReason = "";
+
+  // 承認されるまでループ
+  while (true) {
+    const feedbackSection = buildFeedbackPrompt(feedback, rejectedReason);
+
+    const prompt = `
 以下のスタイルガイドを**厳守**して、YouTube Shorts用の**45秒以内**の台本を生成してください。
 ショート動画なので、簡潔さ最優先。各セクションを短くまとめてください。
 
+チャンネルコンセプト:
+- チャンネル名: セカイノカガク
+- 内容: 海外の科学実験を日本語で45秒解説
+- ターゲット: 日本の一般視聴者（専門知識不要）
+- 最初の2秒でフックを作ること
+- 専門用語は使わない、話し言葉で
+${feedbackSection}
 === スタイルガイド ===
 ${styleGuide}
 
@@ -524,27 +663,58 @@ ${JSON.stringify(explanation, null, 2)}
   例：酸素 → さんそ、触媒 → しょくばい、泡 → あわ、炎 → ほのお
 `;
 
-  const scriptText = await withRetry(
-    () => Promise.resolve(callGemini({
-        model: "gemini-2.5-flash",
-        prompt,
-        systemInstruction:
-          "あなたはフェニックスというキャラクターで台本を書くライターです。スタイルガイドを必ず守ってください。",
-      })),
-    3,
-    "step3"
-  );
+    const scriptText = await withRetry(
+      () => Promise.resolve(callGemini({
+          model: "gemini-2.5-flash",
+          prompt,
+          systemInstruction:
+            "あなたはフェニックスというキャラクターで台本を書くライターです。スタイルガイドを必ず守ってください。",
+        })),
+      3,
+      "step3"
+    );
 
-  writeText(PATHS.script, scriptText.trim());
-  console.log(`✓ script.txt を保存しました`);
-  console.log("--- 台本プレビュー（先頭200字） ---");
-  console.log(scriptText.slice(0, 200));
-  console.log("-----------------------------------");
-  return scriptText;
+    writeText(PATHS.script, scriptText.trim());
+    console.log(`✓ script.txt を保存しました`);
+
+    // ---- 承認フロー ----
+    console.log("\n" + "=".repeat(50));
+    console.log("  生成された台本");
+    console.log("=".repeat(50));
+    console.log(scriptText.trim());
+    console.log("=".repeat(50) + "\n");
+
+    if (!APPROVAL_MODE) {
+      // --no-approval モード: そのまま続行
+      console.log("  （承認スキップ: --no-approval モード）");
+      return scriptText;
+    }
+
+    const answer = await ask("この台本でOKですか？ (y/n): ");
+
+    if (answer.toLowerCase() === "y") {
+      const reason = await ask("OKの理由（任意・Enterでスキップ）: ");
+      feedback.approved.push({ script: scriptText, reason: reason || "OK" });
+      // 合計5件以上でスタイルルールを自動更新
+      if (feedback.approved.length + feedback.rejected.length >= 5) {
+        feedback.style_rules = await autoUpdateStyleRules(feedback);
+      }
+      saveFeedback(feedback);
+      console.log("  ✓ feedback.json にOK記録を保存しました");
+      return scriptText;
+    } else {
+      rejectedReason = await ask("NGの理由を入力してください: ");
+      feedback.rejected.push({ script: scriptText, reason: rejectedReason });
+      saveFeedback(feedback);
+      console.log(`  → 台本を再生成します（理由: ${rejectedReason}）\n`);
+    }
+  }
 }
 
 /**
  * ステップ4: ElevenLabs API で音声生成し narration.mp3 に保存
+ * APPROVAL_MODE=true のとき、生成後に確認プロンプトを表示し
+ * n の場合は voice_settings を微調整して再生成する。
  */
 async function step4_generateAudio() {
   console.log("\n=== ステップ4: ナレーション音声の生成 ===");
@@ -555,70 +725,87 @@ async function step4_generateAudio() {
     );
   }
 
-  const apiKey = process.env.ELEVENLABS_API_KEY;
+  const apiKey  = process.env.ELEVENLABS_API_KEY;
   const voiceId = process.env.ELEVENLABS_VOICE_ID;
-
-  if (!apiKey) throw new Error("ELEVENLABS_API_KEY が設定されていません");
+  if (!apiKey)  throw new Error("ELEVENLABS_API_KEY が設定されていません");
   if (!voiceId) throw new Error("ELEVENLABS_VOICE_ID が設定されていません");
 
   const scriptText = fs.readFileSync(PATHS.script, "utf-8");
-
-  // セクションタグを除去してナレーション用テキストを作成
-  // さらに漢字→読み仮名変換でElevenLabsの誤読を防ぐ
   const narrationText = convertKanjiForTTS(
-    scriptText
-      .replace(/\[.+?\]/g, "")
-      .replace(/\n{2,}/g, "\n")
-      .trim()
+    scriptText.replace(/\[.+?\]/g, "").replace(/\n{2,}/g, "\n").trim()
   );
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
-  const body = JSON.stringify({
-    text: narrationText,
-    model_id: "eleven_multilingual_v2",
-    voice_settings: {
-      stability: 0.5,
-      similarity_boost: 0.8,
-      style: 0.4,
-      use_speaker_boost: true,
-    },
-  });
-
   ensureDir(PATHS.audio);
 
-  await withRetry(() => {
-    const tmpBody = path.join(os.tmpdir(), `el_req_${Date.now()}.json`);
-    try {
-      fs.writeFileSync(tmpBody, body, "utf-8");
+  // 音声パラメータ（NGのたびに stability を微調整）
+  let voiceSettings = { stability: 0.5, similarity_boost: 0.8, style: 0.4, use_speaker_boost: true };
 
-      // curl 1回で直接ファイルに保存し、ステータスコードを標準出力へ
-      const statusRaw = execSync(
-        `curl -sS -k -X POST ` +
-          `-H ${JSON.stringify(`xi-api-key: ${apiKey}`)} ` +
-          `-H "Content-Type: application/json" ` +
-          `-H "Accept: audio/mpeg" ` +
-          `-d @${JSON.stringify(tmpBody)} ` +
-          `-o ${JSON.stringify(PATHS.audio)} ` +
-          `-w "%{http_code}" ` +
-          JSON.stringify(url),
-        { stdio: ["ignore", "pipe", "pipe"] }
-      ).toString().trim();
-
-      if (statusRaw !== "200") {
-        // エラー時はレスポンス本文がファイルに入っているので読み取る
-        const errBody = fs.existsSync(PATHS.audio)
-          ? fs.readFileSync(PATHS.audio, "utf-8")
-          : "(レスポンスなし)";
-        try { fs.unlinkSync(PATHS.audio); } catch { /* ignore */ }
-        throw new Error(`ElevenLabs API エラー ${statusRaw}: ${errBody}`);
+  const generateAudio = () => {
+    const body = JSON.stringify({
+      text: narrationText,
+      model_id: "eleven_multilingual_v2",
+      voice_settings: voiceSettings,
+    });
+    return withRetry(() => {
+      const tmpBody = path.join(os.tmpdir(), `el_req_${Date.now()}.json`);
+      try {
+        fs.writeFileSync(tmpBody, body, "utf-8");
+        const statusRaw = execSync(
+          `curl -sS -k -X POST ` +
+            `-H ${JSON.stringify(`xi-api-key: ${apiKey}`)} ` +
+            `-H "Content-Type: application/json" ` +
+            `-H "Accept: audio/mpeg" ` +
+            `-d @${JSON.stringify(tmpBody)} ` +
+            `-o ${JSON.stringify(PATHS.audio)} ` +
+            `-w "%{http_code}" ` +
+            JSON.stringify(url),
+          { stdio: ["ignore", "pipe", "pipe"] }
+        ).toString().trim();
+        if (statusRaw !== "200") {
+          const errBody = fs.existsSync(PATHS.audio) ? fs.readFileSync(PATHS.audio, "utf-8") : "(なし)";
+          try { fs.unlinkSync(PATHS.audio); } catch { /* ignore */ }
+          throw new Error(`ElevenLabs API エラー ${statusRaw}: ${errBody}`);
+        }
+      } finally {
+        try { fs.unlinkSync(tmpBody); } catch { /* ignore */ }
       }
-    } finally {
-      try { fs.unlinkSync(tmpBody); } catch { /* ignore */ }
-    }
-  }, 3, "step4");
+    }, 3, "step4");
+  };
 
+  await generateAudio();
   const sizeMB = (fs.statSync(PATHS.audio).size / 1024 / 1024).toFixed(2);
   console.log(`✓ narration.mp3 を保存しました (${sizeMB} MB)`);
+
+  // ---- 承認フロー ----
+  if (!APPROVAL_MODE) return PATHS.audio;
+
+  while (true) {
+    console.log("\n" + "=".repeat(50));
+    console.log("  音声ファイルを確認してください");
+    console.log(`  場所: ${PATHS.audio}`);
+    console.log("  ファイルマネージャーで narration.mp3 を再生してください");
+    console.log("=".repeat(50) + "\n");
+
+    const answer = await ask("この音声でOKですか？ (y/n): ");
+    if (answer.toLowerCase() === "y") {
+      console.log("  ✓ 音声確認OK");
+      break;
+    }
+
+    const reason = await ask("NGの理由（早口/遅い/声質など）: ");
+    // stability を ±0.05 で交互に調整して再生成
+    voiceSettings = {
+      ...voiceSettings,
+      stability:     Math.min(1, Math.max(0, voiceSettings.stability + (voiceSettings.stability < 0.7 ? 0.1 : -0.1))),
+      style:         Math.min(1, Math.max(0, voiceSettings.style     + (reason.includes("遅") ? -0.05 : 0.05))),
+    };
+    console.log(`  → 音声パラメータ調整 (stability=${voiceSettings.stability.toFixed(2)}, style=${voiceSettings.style.toFixed(2)}) して再生成します`);
+    await generateAudio();
+    const sz = (fs.statSync(PATHS.audio).size / 1024 / 1024).toFixed(2);
+    console.log(`✓ narration.mp3 を再生成しました (${sz} MB)`);
+  }
+
   return PATHS.audio;
 }
 
@@ -1045,6 +1232,60 @@ async function stepBgm_fetchBGM() {
 }
 
 /**
+ * ステップFilmora: Filmora15で仕上げるための素材を output/filmora/ にまとめて出力する。
+ *
+ * 出力ファイル:
+ *   output/filmora/script.txt        … 確定台本
+ *   output/filmora/narration.mp3     … ElevenLabs音声
+ *   output/filmora/subtitles.srt     … 字幕
+ *   output/filmora/background_1.mp4  … 背景クリップ（番号付き）
+ *   output/filmora/background_2.mp4  …
+ */
+async function stepFilmora_exportAssets() {
+  console.log("\n=== ステップFilmora: 素材出力 ===");
+
+  const dir = PATHS.filmoraDir;
+  fs.mkdirSync(dir, { recursive: true });
+
+  const copied = [];
+
+  const copyIfExists = (src, destName) => {
+    if (fs.existsSync(src)) {
+      fs.copyFileSync(src, path.join(dir, destName));
+      copied.push(destName);
+      console.log(`  ✓ ${destName}`);
+    } else {
+      console.warn(`  ⚠ ${destName} をスキップ（${src} が存在しません）`);
+    }
+  };
+
+  copyIfExists(PATHS.script, "script.txt");
+  copyIfExists(PATHS.audio,  "narration.mp3");
+  copyIfExists(PATHS.srt,    "subtitles.srt");
+
+  // 個別クリップを background_N.mp4 としてコピー
+  if (fs.existsSync(PATHS.clips)) {
+    const clips = fs.readdirSync(PATHS.clips)
+      .filter((f) => f.startsWith("clip_") && f.endsWith(".mp4"))
+      .sort((a, b) => {
+        const na = parseInt(a.match(/\d+/)?.[0] ?? "0", 10);
+        const nb = parseInt(b.match(/\d+/)?.[0] ?? "0", 10);
+        return na - nb;
+      });
+    clips.forEach((clip, i) => {
+      const destName = `background_${i + 1}.mp4`;
+      fs.copyFileSync(path.join(PATHS.clips, clip), path.join(dir, destName));
+      copied.push(destName);
+      console.log(`  ✓ ${destName}`);
+    });
+  }
+
+  console.log(`\n✓ ${copied.length} 件の素材を ${dir} に出力しました`);
+  console.log("  Filmora15 でこのフォルダの素材を読み込んでください");
+  return dir;
+}
+
+/**
  * script.txt のセクションヘッダーを解析して字幕データを返す。
  *
  * 対応フォーマット①（ヘッダーあり）:
@@ -1344,16 +1585,23 @@ async function main() {
     ? /^\d+$/.test(stepStr) ? parseInt(stepStr, 10) : stepStr
     : null;
 
+  // --no-approval フラグ: 承認プロンプトをスキップして全自動実行
+  if (args.includes("--no-approval")) {
+    APPROVAL_MODE = false;
+    console.log("  ℹ 承認スキップモード (--no-approval)");
+  }
+
   const steps = [
     { num: 1,         fn: step1_fetchCandidates,       name: "海外動画収集" },
     { num: 2,         fn: step2_generateExplanation,   name: "深掘り解説生成" },
-    { num: 3,         fn: step3_generateScript,        name: "台本生成" },
-    { num: 4,         fn: step4_generateAudio,         name: "音声生成" },
+    { num: 3,         fn: step3_generateScript,        name: "台本生成（承認あり）" },
+    { num: 4,         fn: step4_generateAudio,         name: "音声生成（承認あり）" },
     { num: "whisper", fn: stepWhisper_alignAudio,      name: "音声タイミング解析" },
     { num: "bg",      fn: stepBg_fetchBackgroundVideo, name: "背景動画生成" },
     { num: "sfx",     fn: stepSfx_fetchSoundEffects,   name: "効果音取得" },
     { num: "bgm",     fn: stepBgm_fetchBGM,            name: "BGM取得" },
     { num: 5,         fn: step5_renderVideo,           name: "動画レンダリング" },
+    { num: "filmora", fn: stepFilmora_exportAssets,    name: "Filmora素材出力" },
   ];
 
   const stepsToRun = targetStep !== null
@@ -1363,7 +1611,7 @@ async function main() {
   if (stepsToRun.length === 0) {
     console.error(
       `ステップ "${targetStep}" は存在しません。\n` +
-      `有効な値: 1, 2, 3, 4, whisper, bg, sfx, bgm, 5`
+      `有効な値: 1, 2, 3, 4, whisper, bg, sfx, bgm, 5, filmora`
     );
     process.exit(1);
   }
